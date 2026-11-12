@@ -3,5 +3,7 @@
 pub mod did;
 pub mod oidc;
 
-pub use did::DidResolver;
-pub use oidc::OidcValidator;
+pub use did::{DidDocument, DidMethod, DidResolver, ParsedDid, VerificationMethod};
+pub use oidc::{
+    ActorClaim, JwtSignatureVerifier, OidcClaims, OidcValidationOptions, OidcValidator,
+};

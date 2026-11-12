@@ -3,4 +3,6 @@
 
 pub mod pdp;
 
-pub use pdp::{AccessDecision, AccessMode, PolicyEngine};
+pub use pdp::{
+    AccessDecision, AccessMode, AcpPolicy, DelegationGrant, PolicyEngine, SubjectMatcher, WacRule,
+};
