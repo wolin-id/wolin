@@ -1,0 +1,690 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Wolin (월인 · 月印) — Universal Identity & Persistence Fabric</title>
+  <link rel="preconnect" href="https://cdn.jsdelivr.net">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard/dist/web/static/pretendard.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/jetbrains-mono/2.304/web/jetbrains-mono.min.css">
+  <style>
+    :root {
+      --paper: #FDFAF3;
+      --ink: #070706;
+      --black: #050505;
+      --white: #FFFFFF;
+      --sand: #E7DDC9;
+      --line: rgba(7, 7, 6, 0.14);
+      --line-strong: rgba(7, 7, 6, 0.32);
+      --muted: rgba(7, 7, 6, 0.58);
+      --signal: #D7FF3F;
+      --tech: #1E4DFF;
+      --risk: #FF594D;
+      --font-sans: "Pretendard", -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+      --font-mono: "JetBrains Mono", ui-monospace, monospace;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      background-color: var(--paper);
+      color: var(--ink);
+      font-family: var(--font-sans);
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+      overflow-x: hidden;
+    }
+
+    /* Container lines & Shell */
+    .ep-shell {
+      position: relative;
+      max-width: 1400px;
+      margin: 0 auto;
+      border-left: 1px solid var(--line);
+      border-right: 1px solid var(--line);
+      background-color: var(--paper);
+      min-height: 100vh;
+    }
+
+    .ep-shell::before,
+    .ep-shell::after {
+      content: "";
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      width: 1px;
+      background: var(--line);
+      pointer-events: none;
+      z-index: 1;
+    }
+    .ep-shell::before { left: 33.333%; }
+    .ep-shell::after { left: 66.666%; }
+
+    @media (max-width: 960px) {
+      .ep-shell::before, .ep-shell::after { display: none; }
+    }
+
+    /* Top Rail */
+    header.top-rail {
+      position: sticky;
+      top: 0;
+      z-index: 50;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 1rem 2rem;
+      border-bottom: 1px solid var(--line);
+      background: rgba(253, 250, 243, 0.92);
+      backdrop-filter: blur(12px);
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }
+
+    .brand-mark {
+      width: 28px;
+      height: 28px;
+      background: var(--ink);
+      color: var(--paper);
+      border-radius: 4px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 800;
+      font-size: 0.85rem;
+      letter-spacing: -0.05em;
+    }
+
+    .brand-name {
+      font-weight: 700;
+      font-size: 1.15rem;
+      letter-spacing: -0.02em;
+    }
+
+    .brand-sub {
+      font-size: 0.8rem;
+      color: var(--muted);
+      font-family: var(--font-mono);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    nav.nav-links {
+      display: flex;
+      gap: 1.5rem;
+      font-size: 0.9rem;
+      font-weight: 500;
+    }
+
+    nav.nav-links a {
+      color: var(--muted);
+      text-decoration: none;
+      transition: color 0.15s;
+    }
+
+    nav.nav-links a:hover {
+      color: var(--ink);
+    }
+
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.35rem 0.75rem;
+      border: 1px solid var(--line);
+      border-radius: 100px;
+      font-size: 0.75rem;
+      font-family: var(--font-mono);
+      background: var(--white);
+    }
+
+    .status-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: #10B981;
+      box-shadow: 0 0 6px rgba(16, 185, 129, 0.6);
+    }
+
+    /* Hero Section */
+    section.hero {
+      position: relative;
+      z-index: 2;
+      padding: 6rem 2rem 5rem 2rem;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .eyebrow {
+      font-family: var(--font-mono);
+      font-size: 0.8rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--tech);
+      margin-bottom: 1.5rem;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .eyebrow::before {
+      content: "";
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      background: var(--signal);
+      border: 1px solid var(--ink);
+    }
+
+    h1.hero-title {
+      font-size: clamp(2.5rem, 5.5vw, 4.8rem);
+      font-weight: 800;
+      letter-spacing: -0.04em;
+      line-height: 1.08;
+      max-width: 980px;
+      margin-bottom: 1.75rem;
+    }
+
+    p.hero-lead {
+      font-size: clamp(1.1rem, 2vw, 1.4rem);
+      color: var(--muted);
+      max-width: 760px;
+      margin-bottom: 2.75rem;
+      letter-spacing: -0.01em;
+      line-height: 1.5;
+    }
+
+    .hero-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 1rem;
+      align-items: center;
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.85rem 1.75rem;
+      font-size: 0.95rem;
+      font-weight: 600;
+      text-decoration: none;
+      border-radius: 4px;
+      transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+      cursor: pointer;
+    }
+
+    .btn-primary {
+      background: var(--ink);
+      color: var(--paper);
+      border: 1px solid var(--ink);
+    }
+
+    .btn-primary:hover {
+      background: var(--black);
+      transform: translateY(-1px);
+      box-shadow: 0 4px 12px rgba(0,0,0,0.12);
+    }
+
+    .btn-secondary {
+      background: var(--white);
+      color: var(--ink);
+      border: 1px solid var(--line-strong);
+    }
+
+    .btn-secondary:hover {
+      background: var(--sand);
+    }
+
+    /* Split Section: Philosophy vs Reality */
+    section.grid-split {
+      position: relative;
+      z-index: 2;
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      border-bottom: 1px solid var(--line);
+    }
+
+    @media (max-width: 960px) {
+      section.grid-split { grid-template-columns: 1fr; }
+    }
+
+    .card {
+      padding: 3rem 2rem;
+      border-right: 1px solid var(--line);
+      position: relative;
+    }
+
+    .card:last-child {
+      border-right: none;
+    }
+
+    @media (max-width: 960px) {
+      .card { border-right: none; border-bottom: 1px solid var(--line); }
+      .card:last-child { border-bottom: none; }
+    }
+
+    .card-num {
+      font-family: var(--font-mono);
+      font-size: 0.85rem;
+      color: var(--muted);
+      margin-bottom: 1.5rem;
+    }
+
+    .card h3 {
+      font-size: 1.4rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      margin-bottom: 1rem;
+    }
+
+    .card p {
+      font-size: 0.95rem;
+      color: var(--muted);
+      line-height: 1.6;
+    }
+
+    .tag-crypto {
+      display: inline-block;
+      padding: 0.15rem 0.5rem;
+      background: rgba(255, 89, 77, 0.12);
+      color: var(--risk);
+      font-family: var(--font-mono);
+      font-size: 0.75rem;
+      font-weight: 600;
+      margin-bottom: 0.75rem;
+      border-radius: 2px;
+    }
+
+    .tag-sane {
+      display: inline-block;
+      padding: 0.15rem 0.5rem;
+      background: rgba(215, 255, 63, 0.4);
+      color: var(--ink);
+      font-family: var(--font-mono);
+      font-size: 0.75rem;
+      font-weight: 700;
+      margin-bottom: 0.75rem;
+      border-radius: 2px;
+    }
+
+    /* Architecture & Interactive Docs Console */
+    section.docs-section {
+      position: relative;
+      z-index: 2;
+      padding: 4rem 2rem;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .section-head {
+      margin-bottom: 2.5rem;
+    }
+
+    .section-head h2 {
+      font-size: 2.2rem;
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      margin-bottom: 0.5rem;
+    }
+
+    .section-head p {
+      font-size: 1.05rem;
+      color: var(--muted);
+    }
+
+    .console-box {
+      background: #0D1117;
+      border-radius: 8px;
+      overflow: hidden;
+      box-shadow: 0 12px 32px rgba(0,0,0,0.18);
+      border: 1px solid rgba(255,255,255,0.08);
+    }
+
+    .console-header {
+      background: #161B22;
+      padding: 0.75rem 1.25rem;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 1px solid rgba(255,255,255,0.08);
+    }
+
+    .console-tabs {
+      display: flex;
+      gap: 1rem;
+    }
+
+    .tab-btn {
+      background: none;
+      border: none;
+      color: #8B949E;
+      font-family: var(--font-mono);
+      font-size: 0.8rem;
+      cursor: pointer;
+      padding: 0.25rem 0;
+      transition: color 0.15s;
+    }
+
+    .tab-btn.active {
+      color: #58A6FF;
+      border-bottom: 2px solid #58A6FF;
+    }
+
+    .console-body {
+      padding: 1.5rem;
+      font-family: var(--font-mono);
+      font-size: 0.88rem;
+      color: #C9D1D9;
+      line-height: 1.6;
+      overflow-x: auto;
+    }
+
+    pre code {
+      font-family: inherit;
+    }
+
+    .kw { color: #FF7B72; }
+    .fn { color: #D2A8FF; }
+    .str { color: #A5D6FF; }
+    .cmt { color: #8B949E; font-style: italic; }
+    .var { color: #79C0FF; }
+
+    /* Performance Specs Rail */
+    section.perf-rail {
+      position: relative;
+      z-index: 2;
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      border-bottom: 1px solid var(--line);
+      background: var(--white);
+    }
+
+    @media (max-width: 960px) {
+      section.perf-rail { grid-template-columns: repeat(2, 1fr); }
+    }
+
+    .perf-metric {
+      padding: 2.5rem 2rem;
+      border-right: 1px solid var(--line);
+    }
+
+    .perf-metric:last-child {
+      border-right: none;
+    }
+
+    .perf-val {
+      font-size: 2.4rem;
+      font-weight: 800;
+      font-family: var(--font-mono);
+      letter-spacing: -0.03em;
+      margin-bottom: 0.35rem;
+      color: var(--ink);
+    }
+
+    .perf-label {
+      font-size: 0.85rem;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    /* Footer */
+    footer.bottom-rail {
+      position: relative;
+      z-index: 2;
+      padding: 3rem 2rem;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      background: var(--paper);
+    }
+
+    @media (max-width: 768px) {
+      footer.bottom-rail { flex-direction: column; gap: 1.5rem; align-items: flex-start; }
+    }
+
+    .footer-copy {
+      font-size: 0.85rem;
+      color: var(--muted);
+    }
+
+    .footer-links {
+      display: flex;
+      gap: 1.5rem;
+      font-size: 0.85rem;
+      font-family: var(--font-mono);
+    }
+
+    .footer-links a {
+      color: var(--ink);
+      text-decoration: none;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="ep-shell">
+    <!-- Top Rail -->
+    <header class="top-rail">
+      <div class="brand">
+        <div class="brand-mark">月</div>
+        <div>
+          <div class="brand-name">WOLIN (월인)</div>
+        </div>
+      </div>
+      <nav class="nav-links">
+        <a href="#vision">비전</a>
+        <a href="#architecture">아키텍처</a>
+        <a href="#specs">명세 & 인터페이스</a>
+        <a href="#benchmarks">성능</a>
+      </nav>
+      <div class="status-badge">
+        <span class="status-dot"></span>
+        <span>DAEMON: RUNNING</span>
+      </div>
+    </header>
+
+    <!-- Hero Section -->
+    <section class="hero">
+      <div class="eyebrow">Universal Identity & Persistence Fabric</div>
+      <h1 class="hero-title">One Identity.<br>Infinite Reflections. (月印千江)</h1>
+      <p class="hero-lead">
+        애플리케이션은 생겨나고 사라지지만, 아이덴티티는 지속되고 데이터는 흐릅니다.<br>
+        Wolin은 투기적 코인과 비싼 가스비를 걷어내고, W3C Solid 규격과 Oxigraph 시맨틱 그래프, 그리고 AI Agent MCP를 단일 초경량 Rust 런타임으로 결합한 <strong>인간 중심의 소버린 Web3 인프라</strong>입니다.
+      </p>
+      <div class="hero-actions">
+        <a href="#specs" class="btn btn-primary">스펙 & 인터페이스 탐색</a>
+        <a href="https://github.com/entropyparadox/wolin" target="_blank" class="btn btn-secondary">GitHub Repository</a>
+      </div>
+    </section>
+
+    <!-- Performance Specs Bar -->
+    <section class="perf-rail" id="benchmarks">
+      <div class="perf-metric">
+        <div class="perf-val">&lt; 30MB</div>
+        <div class="perf-label">Memory Footprint (Rust AOT)</div>
+      </div>
+      <div class="perf-metric">
+        <div class="perf-val">&lt; 1.8ms</div>
+        <div class="perf-label">P99 Read / SPARQL Query</div>
+      </div>
+      <div class="perf-metric">
+        <div class="perf-val">0 GC</div>
+        <div class="perf-label">Zero Garbage Collection Latency</div>
+      </div>
+      <div class="perf-metric">
+        <div class="perf-val">100%</div>
+        <div class="perf-label">W3C Solid & MCP Compliant</div>
+      </div>
+    </section>
+
+    <!-- 3-Pillar Comparison: Web 2.0 vs Speculative Crypto vs Wolin -->
+    <section class="grid-split" id="vision">
+      <div class="card">
+        <div class="card-num">01 / PLATFORM FEUDALISM</div>
+        <span class="tag-crypto">WEB 2.0</span>
+        <h3>사일로화된 데이터 독점</h3>
+        <p>플랫폼이 사용자의 데이터를 인질로 삼아 락인(Lock-in)합니다. 탈퇴하면 나의 기억과 지식 네트워크가 소멸되며, AI 에이전트는 빅테크의 허락 없이는 내 데이터에 접근할 수 없습니다.</p>
+      </div>
+
+      <div class="card">
+        <div class="card-num">02 / FINANCIAL DISTORTION</div>
+        <span class="tag-crypto">SPECULATIVE WEB3</span>
+        <h3>토큰 투기와 비싼 가스비</h3>
+        <p>진정한 데이터 주권 대신 코인 가격과 유동성 파밍에 매몰되었습니다. 단순 프로필 하나 저장하는 데에도 수 달러의 가스비가 들며, 복잡한 개인키 관리로 대중적 채택에 실패했습니다.</p>
+      </div>
+
+      <div class="card">
+        <div class="card-num">03 / SOVEREIGN SEMANTIC FABRIC</div>
+        <span class="tag-sane">WOLIN (月印)</span>
+        <h3>소버린 시맨틱 백본 & AI 위임</h3>
+        <p>코인 없이 순수 암호학(DID/OIDC)으로 신원을 입증하고, OpenDAL + Oxigraph로 내 데이터를 소유합니다. AI 에이전트에게는 Model Context Protocol을 통해 최소 권한의 가상 뷰만을 동적 인가합니다.</p>
+      </div>
+    </section>
+
+    <!-- Interactive Docs / Spec Console -->
+    <section class="docs-section" id="specs">
+      <div class="section-head">
+        <h2>인터랙티브 명세 & 프로토콜</h2>
+        <p>Wolin의 핵심 서브시스템(Solid LDP, Oxigraph SPARQL, Agent MCP, WAC PDP) 인터페이스</p>
+      </div>
+
+      <div class="console-box">
+        <div class="console-header">
+          <div class="console-tabs">
+            <button class="tab-btn active" onclick="showTab('mcp')">01 Agent MCP Handshake</button>
+            <button class="tab-btn" onclick="showTab('sparql')">02 SPARQL Semantic Query</button>
+            <button class="tab-btn" onclick="showTab('policy')">03 Policy Engine (PDP)</button>
+            <button class="tab-btn" onclick="showTab('wellknown')">04 Discovery (.well-known)</button>
+          </div>
+          <span style="font-size: 0.75rem; color: #8B949E; font-family: var(--font-mono);">protocol-v0.1.0</span>
+        </div>
+        <div class="console-body" id="console-display">
+<pre><code><span class="cmt">// AI Agent requests dynamic semantic projection via MCP tool call</span>
+<span class="kw">POST</span> /mcp/tools/call
+<span class="kw">Authorization:</span> DPoP eyJhbGciOiJFUzI1Ni...
+<span class="kw">Content-Type:</span> application/json
+
+{
+  <span class="str">"name"</span>: <span class="str">"wolin_query_semantic"</span>,
+  <span class="str">"arguments"</span>: {
+    <span class="str">"pod"</span>: <span class="str">"wolin://cycorld.id/profile"</span>,
+    <span class="str">"sparql"</span>: <span class="str">"SELECT ?skill ?level WHERE { ?s ep:hasSkill ?skill ; ep:level ?level }"</span>
+  }
+}
+
+<span class="cmt">// Wolin Response: Policy evaluated -> Scoped RDF projection emitted</span>
+{
+  <span class="str">"is_error"</span>: <span class="kw">false</span>,
+  <span class="str">"content"</span>: [
+    {
+      <span class="str">"type"</span>: <span class="str">"text"</span>,
+      <span class="str">"text"</span>: <span class="str">"{\"skills\": [{\"skill\": \"Rust\", \"level\": \"Expert\"}, {\"skill\": \"AI Architecture\", \"level\": \"Master\"}]}"</span>
+    }
+  ]
+}</code></pre>
+        </div>
+      </div>
+    </section>
+
+    <!-- Bottom Rail -->
+    <footer class="bottom-rail">
+      <div class="footer-copy">
+        <strong>엔트로피패러독스 주식회사</strong> (Entropy Paradox, Inc.) · Sovereign AI & Semantic Web3 Systems<br>
+        Wolin Engine is open source under Apache-2.0 / MIT.
+      </div>
+      <div class="footer-links">
+        <a href="#vision">VISION</a>
+        <a href="#specs">DOCS</a>
+        <a href="https://github.com/entropyparadox/wolin" target="_blank">GITHUB</a>
+      </div>
+    </footer>
+  </div>
+
+  <script>
+    const tabContents = {
+      mcp: `<pre><code><span class="cmt">// AI Agent requests dynamic semantic projection via MCP tool call</span>
+<span class="kw">POST</span> /mcp/tools/call
+<span class="kw">Authorization:</span> DPoP eyJhbGciOiJFUzI1Ni...
+<span class="kw">Content-Type:</span> application/json
+
+{
+  <span class="str">"name"</span>: <span class="str">"wolin_query_semantic"</span>,
+  <span class="str">"arguments"</span>: {
+    <span class="str">"pod"</span>: <span class="str">"wolin://cycorld.id/profile"</span>,
+    <span class="str">"sparql"</span>: <span class="str">"SELECT ?skill ?level WHERE { ?s ep:hasSkill ?skill ; ep:level ?level }"</span>
+  }
+}
+
+<span class="cmt">// Wolin Response: Policy evaluated -> Scoped RDF projection emitted</span>
+{
+  <span class="str">"is_error"</span>: <span class="kw">false</span>,
+  <span class="str">"content"</span>: [
+    {
+      <span class="str">"type"</span>: <span class="str">"text"</span>,
+      <span class="str">"text"</span>: <span class="str">"{\\"skills\\": [{\\"skill\\": \\"Rust\\", \\"level\\": \\"Expert\\"}, {\\"skill\\": \\"AI Architecture\\", \\"level\\": \\"Master\\"}]}"</span>
+    }
+  ]
+}</code></pre>`,
+
+      sparql: `<pre><code><span class="cmt">// High-Performance SPARQL SELECT executed via embedded Oxigraph</span>
+<span class="kw">PREFIX</span> ldp: &lt;http://www.w3.org/ns/ldp#&gt;
+<span class="kw">PREFIX</span> dcterms: &lt;http://purl.org/dc/terms/&gt;
+<span class="kw">PREFIX</span> foaf: &lt;http://xmlns.com/foaf/0.1/&gt;
+
+<span class="kw">SELECT</span> ?subject ?predicate ?object
+<span class="kw">WHERE</span> {
+  ?subject foaf:name <span class="str">"Charles Choi"</span> ;
+           foaf:account ?account .
+  ?account dcterms:title ?object .
+}
+<span class="kw">LIMIT</span> 25</code></pre>`,
+
+      policy: `<pre><code><span class="cmt">// Wolin Policy Decision Point (PDP) Evaluation Rule</span>
+<span class="kw">pub fn</span> <span class="fn">evaluate</span>(
+    principal: &amp;<span class="var">Principal</span>,
+    target: &amp;<span class="var">ResourceUri</span>,
+    mode: <span class="var">AccessMode</span>,
+) -&gt; <span class="var">AccessDecision</span> {
+    <span class="kw">match</span> principal {
+        <span class="var">Principal::User</span> { .. } =&gt; <span class="var">AccessDecision::Permit</span>,
+        <span class="var">Principal::Agent</span> { scope, .. } =&gt; {
+            <span class="kw">if</span> scope.contains(&amp;<span class="str">"read"</span>.to_string()) &amp;&amp; mode == <span class="var">AccessMode::Read</span> {
+                <span class="var">AccessDecision::Permit</span>
+            } <span class="kw">else</span> {
+                <span class="var">AccessDecision::Deny</span> { reason: <span class="str">"Lacks required scope"</span>.into() }
+            }
+        }
+        <span class="var">Principal::Anonymous</span> =&gt; <span class="var">AccessDecision::Deny</span> { reason: <span class="str">"Auth required"</span>.into() }
+    }
+}</code></pre>`,
+
+      wellknown: `<pre><code><span class="cmt">// GET /.well-known/wolin — Semantic Fabric Discovery Metadata</span>
+<span class="kw">HTTP/1.1</span> 200 OK
+<span class="kw">Content-Type:</span> application/json
+
+{
+  <span class="str">"wolin_version"</span>: <span class="str">"0.1.0"</span>,
+  <span class="str">"protocols"</span>: [<span class="str">"solid-0.11"</span>, <span class="str">"wac-2.0"</span>, <span class="str">"mcp-2024-11-05"</span>, <span class="str">"oidc-1.0"</span>],
+  <span class="str">"storage_backend"</span>: <span class="str">"opendal+oxigraph"</span>,
+  <span class="str">"identity_mesh"</span>: [<span class="str">"webid"</span>, <span class="str">"did:key"</span>, <span class="str">"did:nostr"</span>, <span class="str">"zitadel-oidc"</span>],
+  <span class="str">"motto"</span>: <span class="str">"One Identity. Infinite Reflections. (月印千江)"</span>
+}</code></pre>`
+    };
+
+    function showTab(tabKey) {
+      document.getElementById('console-display').innerHTML = tabContents[tabKey];
+      document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
+      event.target.classList.add('active');
+    }
+  </script>
+</body>
+</html>
