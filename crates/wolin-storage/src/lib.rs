@@ -8,5 +8,7 @@ pub use graph::{
     ConstructGraph, RdfTerm, RdfTriple, SemanticGraphStore, SparqlBindingRow, SparqlBindingSet,
     SparqlQueryOutput,
 };
+pub use oxigraph::io as rdf_io;
 pub use oxigraph::model as rdf_model;
+pub use oxigraph::sparql as rdf_sparql;
 pub use physical::{BlobMetadata, PhysicalStore};

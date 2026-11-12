@@ -118,6 +118,13 @@ impl PolicyEngine {
         self.wac_rules.push(rule);
     }
 
+    /// Remove all WAC rules whose `id` begins with `id_prefix`, returning the removed count.
+    pub fn remove_wac_rules_by_prefix(&mut self, id_prefix: &str) -> usize {
+        let before = self.wac_rules.len();
+        self.wac_rules.retain(|r| !r.id.starts_with(id_prefix));
+        before - self.wac_rules.len()
+    }
+
     pub fn add_acp_policy(&mut self, policy: AcpPolicy) {
         if policy.all_of.is_empty() && policy.any_of.is_empty() {
             warn!(

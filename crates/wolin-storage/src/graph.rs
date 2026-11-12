@@ -3,7 +3,7 @@ use std::path::Path;
 
 use oxigraph::io::{RdfFormat, RdfParser, RdfSerializer};
 use oxigraph::model::{
-    BlankNode, Literal, NamedNode, NamedNodeRef, Quad, QuadRef, Subject, Term, Triple,
+    BlankNode, GraphNameRef, Literal, NamedNode, NamedNodeRef, Quad, QuadRef, Subject, Term, Triple,
 };
 use oxigraph::sparql::QueryResults;
 use oxigraph::store::Store;
@@ -483,6 +483,106 @@ impl SemanticGraphStore {
             }
             QueryResults::Boolean(value) => Ok(SparqlQueryOutput::Ask { value }),
         }
+    }
+
+    /// Parse an RDF byte payload (`Turtle`, `NTriples`, `JsonLd`, etc.) into default-graph [`Triple`]s,
+    /// resolving relative IRIs against `base_iri` and rejecting named-graph escapes.
+    pub fn parse_rdf_triples(
+        bytes: &[u8],
+        format: RdfFormat,
+        base_iri: &str,
+    ) -> Result<Vec<Triple>> {
+        let parser = RdfParser::from_format(format)
+            .without_named_graphs()
+            .with_base_iri(base_iri)
+            .map_err(|e| {
+                WolinError::InvalidFormat(format!("Invalid RDF base IRI '{base_iri}': {e}"))
+            })?
+            .rename_blank_nodes();
+
+        let mut triples = Vec::new();
+        for quad_res in parser.for_slice(bytes) {
+            let quad =
+                quad_res.map_err(|e| WolinError::InvalidFormat(format!("RDF parse error: {e}")))?;
+            triples.push(Triple::from(quad));
+        }
+        Ok(triples)
+    }
+
+    /// Serialize RDF [`Triple`]s into the requested [`RdfFormat`] (`Turtle`, `NTriples`, `JsonLd`).
+    pub fn serialize_triples(triples: &[Triple], format: RdfFormat) -> Result<Vec<u8>> {
+        let mut serializer = RdfSerializer::from_format(format).for_writer(Vec::new());
+        for triple in triples {
+            serializer
+                .serialize_triple(triple)
+                .map_err(|e| WolinError::Semantic(format!("RDF serialization error: {e}")))?;
+        }
+        serializer
+            .finish()
+            .map_err(|e| WolinError::Semantic(format!("RDF serialization finalize error: {e}")))
+    }
+
+    /// Atomically replace all triples inside named graph `graph_iri` in a single ACID transaction.
+    pub fn replace_named_graph_triples(
+        &self,
+        graph_iri: &str,
+        triples: &[Triple],
+    ) -> Result<usize> {
+        let graph_node = NamedNodeRef::new(graph_iri).map_err(|e| {
+            WolinError::InvalidFormat(format!("Invalid named graph IRI '{graph_iri}': {e}"))
+        })?;
+        let quads: Vec<Quad> = triples
+            .iter()
+            .map(|t| {
+                Quad::new(
+                    t.subject.clone(),
+                    t.predicate.clone(),
+                    t.object.clone(),
+                    graph_node,
+                )
+            })
+            .collect();
+        let count = quads.len();
+
+        self.store
+            .transaction(|mut tx| {
+                tx.remove_named_graph(graph_node)?;
+                tx.extend(quads.iter())?;
+                std::result::Result::<(), oxigraph::store::StorageError>::Ok(())
+            })
+            .map_err(|e| {
+                WolinError::Semantic(format!("Oxigraph named graph replace failed: {e}"))
+            })?;
+        Ok(count)
+    }
+
+    /// Retrieve all [`Triple`]s stored in named graph `graph_iri`.
+    pub fn get_named_graph_triples(&self, graph_iri: &str) -> Result<Vec<Triple>> {
+        let graph_node = NamedNodeRef::new(graph_iri).map_err(|e| {
+            WolinError::InvalidFormat(format!("Invalid named graph IRI '{graph_iri}': {e}"))
+        })?;
+        let mut triples = Vec::new();
+        for quad_res in self.store.quads_for_pattern(
+            None,
+            None,
+            None,
+            Some(GraphNameRef::NamedNode(graph_node)),
+        ) {
+            let quad = quad_res
+                .map_err(|e| WolinError::Semantic(format!("Oxigraph quad read failed: {e}")))?;
+            triples.push(Triple::from(quad));
+        }
+        Ok(triples)
+    }
+
+    /// Delete named graph `graph_iri` and all its triples.
+    pub fn delete_named_graph(&self, graph_iri: &str) -> Result<bool> {
+        let graph_node = NamedNodeRef::new(graph_iri).map_err(|e| {
+            WolinError::InvalidFormat(format!("Invalid named graph IRI '{graph_iri}': {e}"))
+        })?;
+        self.store
+            .remove_named_graph(graph_node)
+            .map_err(|e| WolinError::Semantic(format!("Oxigraph remove_named_graph failed: {e}")))
     }
 
     fn ingest_with_parser(&self, parser: RdfParser, bytes: &[u8]) -> Result<usize> {
