@@ -127,12 +127,30 @@ impl McpAgentServer {
         policy_engine: PolicyEngine,
         config: McpGatewayConfig,
     ) -> Self {
+        Self::with_shared_state(
+            physical_store,
+            graph_store,
+            Arc::new(RwLock::new(policy_engine)),
+            Arc::new(RwLock::new(DisclosurePolicy::new())),
+            Arc::new(tokio::sync::RwLock::new(())),
+            config,
+        )
+    }
+
+    pub fn with_shared_state(
+        physical_store: PhysicalStore,
+        graph_store: SemanticGraphStore,
+        policy_engine: Arc<RwLock<PolicyEngine>>,
+        disclosure_policy: Arc<RwLock<DisclosurePolicy>>,
+        catalog_lock: Arc<tokio::sync::RwLock<()>>,
+        config: McpGatewayConfig,
+    ) -> Self {
         Self {
             physical_store,
             graph_store,
-            policy_engine: Arc::new(RwLock::new(policy_engine)),
-            disclosure_policy: Arc::new(RwLock::new(DisclosurePolicy::new())),
-            catalog_lock: Arc::new(tokio::sync::RwLock::new(())),
+            policy_engine,
+            disclosure_policy,
+            catalog_lock,
             config,
         }
     }

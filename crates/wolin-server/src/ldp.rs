@@ -421,7 +421,7 @@ async fn handle_put(
             })?,
         };
         let triples = SemanticGraphStore::parse_rdf_triples(&body_bytes, rdf_fmt, &resource_iri)?;
-        let rules = extract_wac_rules_from_acl_triples(state, target, &triples)?;
+        let rules = extract_wac_rules_from_acl_triples(&state.config, target, &triples)?;
         PreparedWrite::Acl { triples, rules }
     } else if target.is_container_path || requested_container {
         if !target.is_container_path {
@@ -481,7 +481,9 @@ async fn handle_put(
         }
     };
 
+    let _io_guard = state.catalog_lock.write().await;
     let mut catalog = state.catalog.write().await;
+    *catalog = LdpCatalog::load_or_init(&state.physical_store).await?;
     validate_hierarchy_for_write(&catalog, &target.canonical_path, target.is_container_path)?;
 
     let existing = catalog.entries.get(&target.canonical_path).cloned();
@@ -575,6 +577,7 @@ async fn handle_put(
     );
     catalog.persist(&state.physical_store).await?;
     drop(catalog);
+    drop(_io_guard);
 
     let status = if existing.is_some() {
         StatusCode::NO_CONTENT
@@ -639,7 +642,9 @@ async fn handle_post(
 
     let raw_ct = extract_media_type(headers);
 
+    let _io_guard = state.catalog_lock.write().await;
     let mut catalog = state.catalog.write().await;
+    *catalog = LdpCatalog::load_or_init(&state.physical_store).await?;
     match catalog.entries.get(&target.canonical_path) {
         Some(entry) if entry.kind == ResourceKind::Container => {}
         _ => {
@@ -782,6 +787,7 @@ async fn handle_post(
     );
     catalog.persist(&state.physical_store).await?;
     drop(catalog);
+    drop(_io_guard);
 
     let mut resp = StatusCode::CREATED.into_response();
     if let Ok(loc) = HeaderValue::from_str(&child_iri) {
@@ -850,7 +856,9 @@ async fn handle_patch(
         }
     }
 
+    let _io_guard = state.catalog_lock.write().await;
     let mut catalog = state.catalog.write().await;
+    *catalog = LdpCatalog::load_or_init(&state.physical_store).await?;
     validate_hierarchy_for_write(&catalog, &target.canonical_path, target.is_container_path)?;
 
     let existing = catalog.entries.get(&target.canonical_path).cloned();
@@ -916,7 +924,7 @@ async fn handle_patch(
 
     let acl_rules = if target.is_acl {
         Some(extract_wac_rules_from_acl_triples(
-            state,
+            &state.config,
             target,
             &updated_triples,
         )?)
@@ -960,6 +968,7 @@ async fn handle_patch(
     );
     catalog.persist(&state.physical_store).await?;
     drop(catalog);
+    drop(_io_guard);
 
     let status = if existing.is_some() {
         StatusCode::NO_CONTENT
@@ -1004,7 +1013,9 @@ async fn handle_delete(
         });
     }
 
+    let _io_guard = state.catalog_lock.write().await;
     let mut catalog = state.catalog.write().await;
+    *catalog = LdpCatalog::load_or_init(&state.physical_store).await?;
     let Some(entry) = catalog.entries.get(&target.canonical_path).cloned() else {
         return Err(LdpError::NotFound(format!(
             "LDP resource '{}' not found",
@@ -1061,6 +1072,7 @@ async fn handle_delete(
     catalog.entries.remove(&target.canonical_path);
     catalog.persist(&state.physical_store).await?;
     drop(catalog);
+    drop(_io_guard);
 
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -1319,7 +1331,11 @@ fn parse_ldp_path_str(raw_path: &str, pod_prefix: &str) -> Result<LdpTarget, Ldp
         }
         let decoded = decode_uri_segment(seg)?;
         if idx == 0
-            && (decoded == RESERVED_META_SEG || decoded == ".well-known" || decoded == "health")
+            && (decoded == RESERVED_META_SEG
+                || decoded.starts_with("__wolin_")
+                || decoded == ".well-known"
+                || decoded == "health"
+                || decoded == "mcp")
         {
             return Err(LdpError::BadRequest(format!(
                 "Reserved system path segment '{decoded}' cannot be accessed via LDP"
@@ -2089,8 +2105,35 @@ fn acl_rule_prefix(acl_canonical_path: &str) -> String {
     format!("acl-doc:{acl_canonical_path}#")
 }
 
+pub(crate) fn rehydrate_persisted_acl_rules(
+    graph_store: &SemanticGraphStore,
+    catalog: &LdpCatalog,
+    policy_engine: &mut PolicyEngine,
+    config: &crate::LdpConfig,
+) -> wolin_core::Result<()> {
+    for path in catalog.entries.keys() {
+        if !is_acl_canonical_path(path) {
+            continue;
+        }
+        let target = build_ldp_target_from_canonical(path, &config.pod_uri_prefix);
+        let acl_iri = http_iri(&config.base_url, path);
+        let triples = graph_store.get_named_graph_triples(&acl_iri)?;
+        if triples.is_empty() {
+            continue;
+        }
+        if let Ok(rules) = extract_wac_rules_from_acl_triples(config, &target, &triples) {
+            let prefix = acl_rule_prefix(path);
+            policy_engine.remove_wac_rules_by_prefix(&prefix);
+            for rule in rules {
+                policy_engine.add_wac_rule(rule);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn extract_wac_rules_from_acl_triples(
-    state: &AppState,
+    config: &crate::LdpConfig,
     acl_target: &LdpTarget,
     triples: &[Triple],
 ) -> Result<Vec<WacRule>, LdpError> {
@@ -2172,7 +2215,7 @@ fn extract_wac_rules_from_acl_triples(
                     }
                 },
                 ACL_ACCESS_TO => {
-                    let mapped = map_acl_target_iri_to_policy_uri(state, obj_iri)?;
+                    let mapped = map_acl_target_iri_to_policy_uri(config, obj_iri)?;
                     if mapped != acl_target.policy_target {
                         return Err(LdpError::Forbidden(format!(
                             "ACL document '{}' cannot govern external resource '{}'",
@@ -2187,7 +2230,7 @@ fn extract_wac_rules_from_acl_triples(
                             "acl:default is only valid on container .acl documents".to_string(),
                         ));
                     }
-                    let mapped = map_acl_target_iri_to_policy_uri(state, obj_iri)?;
+                    let mapped = map_acl_target_iri_to_policy_uri(config, obj_iri)?;
                     if mapped != acl_target.policy_target {
                         return Err(LdpError::Forbidden(format!(
                             "ACL document '{}' cannot set acl:default for external container '{}'",
@@ -2223,11 +2266,11 @@ fn extract_wac_rules_from_acl_triples(
 }
 
 fn map_acl_target_iri_to_policy_uri(
-    state: &AppState,
+    config: &crate::LdpConfig,
     raw_iri: &str,
 ) -> Result<ResourceUri, LdpError> {
-    let base = state.config.base_url.trim_end_matches('/');
-    let pod_prefix = state.config.pod_uri_prefix.trim_end_matches('/');
+    let base = config.base_url.trim_end_matches('/');
+    let pod_prefix = config.pod_uri_prefix.trim_end_matches('/');
 
     if let Some(rel_path) = raw_iri.strip_prefix(base) {
         let normalized_http_path = if rel_path.is_empty() { "/" } else { rel_path };

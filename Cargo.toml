@@ -43,3 +43,8 @@ anyhow = "1.0"
 # Semantic & Storage
 oxigraph = "0.4"
 opendal = { version = "0.51", features = ["services-fs", "services-memory"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

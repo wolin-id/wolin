@@ -214,7 +214,8 @@ fn canonicalize_ldp_path(raw_path: &str) -> Result<(String, bool, bool)> {
             && (decoded == RESERVED_META_SEG
                 || decoded.starts_with("__wolin_")
                 || decoded == ".well-known"
-                || decoded == "health")
+                || decoded == "health"
+                || decoded == "mcp")
         {
             return Err(WolinError::InvalidFormat(format!(
                 "Reserved system path segment '{decoded}' cannot be accessed"
@@ -538,6 +539,8 @@ mod tests {
             "http://pod.wolin.local/__wolin_meta/catalog.json",
             "http://pod.wolin.local/.well-known/wolin",
             "http://pod.wolin.local/health",
+            "http://pod.wolin.local/mcp",
+            "http://pod.wolin.local/%6dcp",
             "wolin://foreign_pod/alice/doc.ttl",
             "wolin://../escape/doc.ttl",
             "https://external.example/alice/.%61cl",
