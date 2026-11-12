@@ -9,6 +9,7 @@ authors.workspace = true
 wolin-core.workspace = true
 opendal.workspace = true
 oxigraph.workspace = true
+serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 thiserror.workspace = true

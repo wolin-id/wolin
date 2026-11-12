@@ -4,5 +4,9 @@
 pub mod graph;
 pub mod physical;
 
-pub use graph::SemanticGraphStore;
-pub use physical::PhysicalStore;
+pub use graph::{
+    ConstructGraph, RdfTerm, RdfTriple, SemanticGraphStore, SparqlBindingRow, SparqlBindingSet,
+    SparqlQueryOutput,
+};
+pub use oxigraph::model as rdf_model;
+pub use physical::{BlobMetadata, PhysicalStore};
