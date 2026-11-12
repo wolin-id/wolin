@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>WOLIN (月印) — One Identity. Infinite Reflections.</title>
   <meta name="description" content="Universal Identity & Sovereign Semantic Persistence Fabric for the AI Agent Era. W3C Solid, Oxigraph RDF, OpenDAL, and Zero-Trust MCP in a <30MB Rust runtime.">
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='8' fill='%2304070D'/%3E%3Ccircle cx='20' cy='14' r='6.5' fill='%23F3F6FC'/%3E%3Cpath d='M7 24H33' stroke='%2364E9EE' stroke-width='2' stroke-linecap='round'/%3E%3Cpath d='M12 29H28' stroke='%2364E9EE' stroke-opacity='0.65' stroke-width='1.6' stroke-linecap='round'/%3E%3C/svg%3E">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;0,600;0,700;1,500;1,600&family=JetBrains+Mono:wght@400;500;600;700&family=Noto+Serif+KR:wght@500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -22,7 +23,7 @@
       --selene: #F3F6FC;
       --mercury: #C9D5E8;
       --silver-mist: #8A9BB5;
-      --slate-dim: #586A84;
+      --slate-dim: #8294B0;
 
       /* Bioluminescent Refraction & Optical Signals */
       --refraction: #64E9EE;
@@ -379,6 +380,7 @@
       color: var(--moon-gold);
       margin-bottom: 0.85rem;
       letter-spacing: 0.01em;
+      word-break: keep-all;
     }
 
     .hero-description {
@@ -387,6 +389,7 @@
       line-height: 1.7;
       max-width: 590px;
       margin-bottom: 1.55rem;
+      word-break: keep-all;
     }
 
     .hero-description strong {
@@ -468,16 +471,31 @@
     }
 
     .cli-copy {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 32px;
+      min-width: 56px;
       background: rgba(201, 213, 232, 0.08);
       border: 1px solid var(--line);
-      color: var(--silver-mist);
+      color: var(--mercury);
       font-family: var(--font-mono);
-      font-size: 0.68rem;
-      padding: 0.2rem 0.5rem;
+      font-size: 0.69rem;
+      padding: 0.25rem 0.65rem;
       border-radius: 4px;
       cursor: pointer;
       transition: all 0.18s;
       flex-shrink: 0;
+    }
+
+    @media (max-width: 768px) {
+      .cli-capsule {
+        padding: 0.3rem 0.35rem 0.3rem 0.85rem;
+      }
+      .cli-copy {
+        min-height: 44px;
+        min-width: 64px;
+      }
     }
 
     .cli-copy:hover {
@@ -677,6 +695,7 @@
       letter-spacing: -0.015em;
       color: var(--selene);
       max-width: 700px;
+      word-break: keep-all;
     }
 
     .section-sub {
@@ -684,6 +703,7 @@
       color: var(--silver-mist);
       max-width: 460px;
       line-height: 1.68;
+      word-break: keep-all;
     }
 
     .section-sub code {
@@ -770,6 +790,7 @@
       color: var(--silver-mist);
       line-height: 1.68;
       margin-bottom: 1.35rem;
+      word-break: keep-all;
     }
 
     .epoch-verdict {
@@ -1006,7 +1027,7 @@
     .ty { color: #64E9EE; }
     .fn { color: #D2A8FF; }
     .st { color: #A5F3FC; }
-    .cm { color: #64748B; font-style: italic; }
+    .cm { color: #8599B2; font-style: italic; }
 
     /* Protocol & Endpoint Quick Reference Docs */
     .docs-endpoint-bar {
@@ -1337,8 +1358,12 @@
       color: var(--selene);
       font-family: var(--font-mono);
       font-size: 0.79rem;
-      padding: 0.62rem 0.78rem;
+      padding: 0.68rem 0.78rem;
       outline: none;
+    }
+
+    .sim-select {
+      min-height: 44px;
     }
 
     .sim-select:focus,
@@ -1361,11 +1386,15 @@
     }
 
     .btn-execute {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 44px;
       background: linear-gradient(135deg, #64E9EE 0%, #38BDF8 100%);
       color: #04070D;
       border: none;
       border-radius: 6px;
-      padding: 0.68rem 1.25rem;
+      padding: 0.72rem 1.3rem;
       font-family: var(--font-mono);
       font-size: 0.79rem;
       font-weight: 700;
@@ -1465,6 +1494,10 @@
     }
 
     .footer-links a {
+      display: inline-flex;
+      align-items: center;
+      min-height: 44px;
+      padding: 0 0.25rem;
       color: var(--silver-mist);
       text-decoration: none;
       transition: color 0.18s;
@@ -1510,6 +1543,7 @@
     </div>
   </header>
 
+  <main>
   <!-- 01. Grand Hero -->
   <section class="hero">
     <div class="container">
@@ -1555,7 +1589,7 @@
         </div>
 
         <!-- Right: Interactive 月印千江 Optical Astrolabe -->
-        <div class="astrolabe-stage" aria-label="Lunar Reflection Projection Diagram">
+        <div class="astrolabe-stage" role="region" aria-label="Lunar Reflection Projection Diagram">
           <div class="astrolabe-topbar">
             <span>OPTICAL TOPOLOGY // 月印千江</span>
             <span id="active-ray-label" style="color: var(--refraction);">RAY 01 · CLAUDE MCP</span>
@@ -1652,19 +1686,19 @@
 
           <!-- Interactive River Selector -->
           <div class="river-selector-bar" role="tablist" aria-label="Select River Projection">
-            <button type="button" class="river-chip active" onclick="focusRiver(0, this)">
+            <button type="button" role="tab" aria-selected="true" class="river-chip active" onclick="focusRiver(0, this)">
               <span class="river-chip-title">01 Claude MCP</span>
               <span class="river-chip-scope">scope: read · TTL 5m</span>
             </button>
-            <button type="button" class="river-chip" onclick="focusRiver(1, this)">
+            <button type="button" role="tab" aria-selected="false" class="river-chip" onclick="focusRiver(1, this)">
               <span class="river-chip-title">02 ZITADEL ERP</span>
               <span class="river-chip-scope">oidc + DPoP proof</span>
             </button>
-            <button type="button" class="river-chip" onclick="focusRiver(2, this)">
+            <button type="button" role="tab" aria-selected="false" class="river-chip" onclick="focusRiver(2, this)">
               <span class="river-chip-title">03 Cursor IDE</span>
               <span class="river-chip-scope">zero-PII subgraph</span>
             </button>
-            <button type="button" class="river-chip" onclick="focusRiver(3, this)">
+            <button type="button" role="tab" aria-selected="false" class="river-chip" onclick="focusRiver(3, this)">
               <span class="river-chip-title">04 Public LDP</span>
               <span class="river-chip-scope">foaf:Agent read</span>
             </button>
@@ -1802,7 +1836,7 @@
       <div class="arch-layout">
         <!-- Left: 4 Interactive Architectural Layers -->
         <div class="layer-stack" role="tablist" aria-label="Wolin System Layers">
-          <button type="button" class="layer-btn active" onclick="selectLayer(0, this)">
+          <button type="button" role="tab" aria-selected="true" class="layer-btn active" onclick="selectLayer(0, this)">
             <div>
               <span class="layer-code">LAYER 01 // GATEWAY &amp; CONSENT</span>
               <span class="layer-name">MCP &amp; Policy Gateway (PDP / PEP)</span>
@@ -1811,7 +1845,7 @@
             <span class="layer-crate-badge">wolin-mcp · wolin-policy</span>
           </button>
 
-          <button type="button" class="layer-btn" onclick="selectLayer(1, this)">
+          <button type="button" role="tab" aria-selected="false" class="layer-btn" onclick="selectLayer(1, this)">
             <div>
               <span class="layer-code">LAYER 02 // IDENTITY MESH</span>
               <span class="layer-name">Federated Trust &amp; Identity Mesh</span>
@@ -1820,7 +1854,7 @@
             <span class="layer-crate-badge">wolin-identity</span>
           </button>
 
-          <button type="button" class="layer-btn" onclick="selectLayer(2, this)">
+          <button type="button" role="tab" aria-selected="false" class="layer-btn" onclick="selectLayer(2, this)">
             <div>
               <span class="layer-code">LAYER 03 // SEMANTIC ENGINE</span>
               <span class="layer-name">High-Performance Semantic Core</span>
@@ -1829,7 +1863,7 @@
             <span class="layer-crate-badge">wolin-storage::graph</span>
           </button>
 
-          <button type="button" class="layer-btn" onclick="selectLayer(3, this)">
+          <button type="button" role="tab" aria-selected="false" class="layer-btn" onclick="selectLayer(3, this)">
             <div>
               <span class="layer-code">LAYER 04 // PERSISTENCE FABRIC</span>
               <span class="layer-name">Multi-Backend Storage Virtualization</span>
@@ -2096,6 +2130,7 @@ WHERE {
       </div>
     </div>
   </section>
+  </main>
 
   <!-- Footer -->
   <footer class="meridian-footer">
@@ -2141,8 +2176,12 @@ WHERE {
     ];
 
     function focusRiver(idx, btnEl) {
-      document.querySelectorAll('.river-chip').forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('.river-chip').forEach(b => {
+        b.classList.remove('active');
+        b.setAttribute('aria-selected', 'false');
+      });
       btnEl.classList.add('active');
+      btnEl.setAttribute('aria-selected', 'true');
       document.getElementById('active-ray-label').textContent = riverMeta[idx].label;
 
       for (let i = 0; i < 4; i++) {
@@ -2247,8 +2286,12 @@ WHERE {
     ];
 
     function selectLayer(idx, btnEl) {
-      document.querySelectorAll('.layer-btn').forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('.layer-btn').forEach(b => {
+        b.classList.remove('active');
+        b.setAttribute('aria-selected', 'false');
+      });
       btnEl.classList.add('active');
+      btnEl.setAttribute('aria-selected', 'true');
       const item = archLayers[idx];
       document.getElementById('arch-file-path').textContent = item.path;
       document.getElementById('arch-summary').textContent = item.summary;
