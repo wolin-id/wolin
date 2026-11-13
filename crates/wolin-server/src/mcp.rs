@@ -8,7 +8,7 @@ use axum::{
 };
 use wolin_mcp::protocol::{JsonRpcId, JsonRpcResponse, PARSE_ERROR};
 
-use crate::{auth::extract_principal, error::LdpError, AppState};
+use crate::{auth::extract_principal_for_request, error::LdpError, AppState};
 
 /// Handle Native MCP JSON-RPC 2.0 requests (`POST /mcp`) over Streamable HTTP.
 ///
@@ -24,10 +24,12 @@ pub async fn handle_mcp_post(
         ));
     }
 
+    let method = req.method().clone();
+    let uri = req.uri().clone();
     let headers = req.headers().clone();
 
     // Authenticate caller first (fail-closed 401 on malformed/expired/forged credentials).
-    let principal = extract_principal(&headers, &state.config)?;
+    let principal = extract_principal_for_request(&method, &uri, &headers, &state).await?;
 
     // Validate Content-Type when present (must be application/json).
     if let Some(raw_ct) = headers.get(header::CONTENT_TYPE) {
@@ -95,9 +97,12 @@ pub async fn handle_mcp_post(
 /// pointing to `/mcp` for JSON-RPC 2.0 message submission.
 pub async fn handle_mcp_sse(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    req: Request,
 ) -> Result<Response, LdpError> {
-    let _principal = extract_principal(&headers, &state.config)?;
+    let method = req.method().clone();
+    let uri = req.uri().clone();
+    let headers = req.headers().clone();
+    let _principal = extract_principal_for_request(&method, &uri, &headers, &state).await?;
     validate_sse_accept(&headers)?;
 
     let sse_frame = "event: endpoint\ndata: /mcp\n\n";

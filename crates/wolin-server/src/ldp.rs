@@ -18,7 +18,10 @@ use wolin_storage::{
     PhysicalStore, SemanticGraphStore,
 };
 
-use crate::{auth::extract_principal, error::LdpError, AppState};
+use crate::{
+    auth::extract_principal_for_request, error::LdpError, pods::extract_subdomain_pod, AppState,
+    LdpConfig,
+};
 
 const CATALOG_META_KEY: &str = "__wolin_meta/catalog.json";
 const RESERVED_META_SEG: &str = "__wolin_meta";
@@ -32,6 +35,13 @@ pub const LDP_NON_RDF_SOURCE: &str = "http://www.w3.org/ns/ldp#NonRDFSource";
 pub const LDP_CONTAINER: &str = "http://www.w3.org/ns/ldp#Container";
 pub const LDP_BASIC_CONTAINER: &str = "http://www.w3.org/ns/ldp#BasicContainer";
 pub const LDP_CONTAINS: &str = "http://www.w3.org/ns/ldp#contains";
+pub const LDP_INBOX_REL: &str = "http://www.w3.org/ns/ldp#inbox";
+pub const PIM_STORAGE: &str = "http://www.w3.org/ns/pim/space#Storage";
+pub const PIM_STORAGE_REL: &str = "http://www.w3.org/ns/pim/space#storage";
+pub const SOLID_OIDC_ISSUER: &str = "http://www.w3.org/ns/solid/terms#oidcIssuer";
+pub const FOAF_PERSON: &str = "http://xmlns.com/foaf/0.1/Person";
+pub const FOAF_PERSONAL_PROFILE_DOCUMENT: &str =
+    "http://xmlns.com/foaf/0.1/PersonalProfileDocument";
 
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const ACL_AUTHORIZATION: &str = "http://www.w3.org/ns/auth/acl#Authorization";
@@ -132,12 +142,46 @@ impl LdpCatalog {
 }
 
 #[derive(Debug, Clone)]
-struct LdpTarget {
-    canonical_path: String,
-    is_container_path: bool,
-    is_acl: bool,
-    acl_path: String,
-    policy_target: ResourceUri,
+pub(crate) struct LdpTarget {
+    pub(crate) canonical_path: String,
+    pub(crate) is_container_path: bool,
+    pub(crate) is_acl: bool,
+    pub(crate) acl_path: String,
+    pub(crate) policy_target: ResourceUri,
+    pub(crate) subdomain_ctx: Option<(String, String)>,
+}
+
+impl LdpTarget {
+    fn external_iri(&self, base_url: &str, canonical_path: &str) -> String {
+        if let Some((ref pod_id, ref sub_origin)) = self.subdomain_ctx {
+            let pod_root = format!("/pods/{pod_id}/");
+            if canonical_path == pod_root {
+                return format!("{}/", sub_origin.trim_end_matches('/'));
+            }
+            if let Some(rel) = canonical_path.strip_prefix(&pod_root) {
+                return http_iri(sub_origin, &format!("/{rel}"));
+            }
+        }
+        http_iri(base_url, canonical_path)
+    }
+
+    fn rebase_triples_for_storage(&self, base_url: &str, triples: Vec<Triple>) -> Vec<Triple> {
+        let Some((ref pod_id, ref sub_origin)) = self.subdomain_ctx else {
+            return triples;
+        };
+        let from_prefix = format!("{}/", sub_origin.trim_end_matches('/'));
+        let to_prefix = format!("{}/pods/{pod_id}/", base_url.trim_end_matches('/'));
+        rebase_triples(triples, &from_prefix, &to_prefix)
+    }
+
+    fn rebase_triples_for_response(&self, base_url: &str, triples: Vec<Triple>) -> Vec<Triple> {
+        let Some((ref pod_id, ref sub_origin)) = self.subdomain_ctx else {
+            return triples;
+        };
+        let from_prefix = format!("{}/pods/{pod_id}/", base_url.trim_end_matches('/'));
+        let to_prefix = format!("{}/", sub_origin.trim_end_matches('/'));
+        rebase_triples(triples, &from_prefix, &to_prefix)
+    }
 }
 
 pub async fn handle_ldp_request(
@@ -149,8 +193,8 @@ pub async fn handle_ldp_request(
     let headers = req.headers().clone();
     let body = req.into_body();
 
-    let principal = extract_principal(&headers, &state.config)?;
-    let target = parse_ldp_target(&uri, &state.config.pod_uri_prefix)?;
+    let principal = extract_principal_for_request(&method, &uri, &headers, &state).await?;
+    let target = parse_ldp_target(&uri, &headers, &state.config)?;
 
     match method {
         Method::OPTIONS => handle_options(&state, &principal, &target).await,
@@ -246,6 +290,17 @@ async fn handle_get_or_head(
                     Term::NamedNode(NamedNode::new(type_iri).unwrap()),
                 ));
             }
+            if entry.path == "/" || is_pod_root_path(&entry.path) {
+                let pim_storage_node = NamedNode::new(PIM_STORAGE).unwrap();
+                let storage_triple = Triple::new(
+                    Subject::NamedNode(container_node.clone()),
+                    rdf_type_node.clone(),
+                    Term::NamedNode(pim_storage_node),
+                );
+                if !triples.contains(&storage_triple) {
+                    triples.push(storage_triple);
+                }
+            }
 
             let contains_pred = NamedNode::new(LDP_CONTAINS).unwrap();
             for child in children {
@@ -279,7 +334,8 @@ async fn handle_get_or_head(
             }
             check_if_match_get(headers, &effective_etag)?;
 
-            let serialized = SemanticGraphStore::serialize_triples(&triples, negotiated_format)?;
+            let rebased = target.rebase_triples_for_response(&state.config.base_url, triples);
+            let serialized = SemanticGraphStore::serialize_triples(&rebased, negotiated_format)?;
             build_payload_response(
                 state,
                 principal,
@@ -311,7 +367,8 @@ async fn handle_get_or_head(
             check_if_match_get(headers, &entry.etag)?;
 
             let triples = state.graph_store.get_named_graph_triples(&resource_iri)?;
-            let serialized = SemanticGraphStore::serialize_triples(&triples, negotiated_format)?;
+            let rebased = target.rebase_triples_for_response(&state.config.base_url, triples);
+            let serialized = SemanticGraphStore::serialize_triples(&rebased, negotiated_format)?;
             build_payload_response(
                 state,
                 principal,
@@ -388,6 +445,7 @@ async fn handle_put(
 
     let raw_ct = extract_media_type(headers);
     let resource_iri = http_iri(&state.config.base_url, &target.canonical_path);
+    let parse_base_iri = target.external_iri(&state.config.base_url, &target.canonical_path);
 
     enum PreparedWrite {
         Container {
@@ -420,7 +478,8 @@ async fn handle_put(
                 ))
             })?,
         };
-        let triples = SemanticGraphStore::parse_rdf_triples(&body_bytes, rdf_fmt, &resource_iri)?;
+        let parsed = SemanticGraphStore::parse_rdf_triples(&body_bytes, rdf_fmt, &parse_base_iri)?;
+        let triples = target.rebase_triples_for_storage(&state.config.base_url, parsed);
         let rules = extract_wac_rules_from_acl_triples(&state.config, target, &triples)?;
         PreparedWrite::Acl { triples, rules }
     } else if target.is_container_path || requested_container {
@@ -445,7 +504,9 @@ async fn handle_put(
                     "Unsupported Content-Type '{ct}' for LDP BasicContainer"
                 ))
             })?;
-            SemanticGraphStore::parse_rdf_triples(&body_bytes, rdf_fmt, &resource_iri)?
+            let parsed =
+                SemanticGraphStore::parse_rdf_triples(&body_bytes, rdf_fmt, &parse_base_iri)?;
+            target.rebase_triples_for_storage(&state.config.base_url, parsed)
         };
         reject_client_contains_triples(&triples)?;
         PreparedWrite::Container { triples }
@@ -453,16 +514,18 @@ async fn handle_put(
         match raw_ct.as_deref() {
             Some(ct) if !requested_non_rdf && parse_rdf_media_type(ct).is_some() => {
                 let rdf_fmt = parse_rdf_media_type(ct).unwrap();
-                let triples =
-                    SemanticGraphStore::parse_rdf_triples(&body_bytes, rdf_fmt, &resource_iri)?;
+                let parsed =
+                    SemanticGraphStore::parse_rdf_triples(&body_bytes, rdf_fmt, &parse_base_iri)?;
+                let triples = target.rebase_triples_for_storage(&state.config.base_url, parsed);
                 PreparedWrite::Rdf { triples }
             }
             None if requested_rdf_source => {
-                let triples = SemanticGraphStore::parse_rdf_triples(
+                let parsed = SemanticGraphStore::parse_rdf_triples(
                     &body_bytes,
                     RdfFormat::Turtle,
-                    &resource_iri,
+                    &parse_base_iri,
                 )?;
+                let triples = target.rebase_triples_for_storage(&state.config.base_url, parsed);
                 PreparedWrite::Rdf { triples }
             }
             Some(ct) if requested_rdf_source => {
@@ -586,7 +649,7 @@ async fn handle_put(
     };
     let mut resp = status.into_response();
     if status == StatusCode::CREATED {
-        if let Ok(loc) = HeaderValue::from_str(&resource_iri) {
+        if let Ok(loc) = HeaderValue::from_str(&parse_base_iri) {
             resp.headers_mut().insert(header::LOCATION, loc);
         }
     }
@@ -671,7 +734,9 @@ async fn handle_post(
     } else {
         format!("{}{}", target.canonical_path, final_slug)
     };
-    let child_target = build_ldp_target_from_canonical(&child_path, &state.config.pod_uri_prefix);
+    let mut child_target =
+        build_ldp_target_from_canonical(&child_path, &state.config.pod_uri_prefix);
+    child_target.subdomain_ctx = target.subdomain_ctx.clone();
 
     // Ensure child URI does not trigger an explicit ACP deny rule (e.g. via crafted Slug).
     ensure_no_explicit_acp_deny(
@@ -682,6 +747,7 @@ async fn handle_post(
     )?;
 
     let child_iri = http_iri(&state.config.base_url, &child_path);
+    let ext_child_iri = child_target.external_iri(&state.config.base_url, &child_path);
 
     let (child_kind, stored_ct, new_etag) = if requested_container {
         let triples = if body_bytes.is_empty() {
@@ -700,7 +766,9 @@ async fn handle_post(
                     "Unsupported Content-Type '{ct}' for LDP BasicContainer"
                 ))
             })?;
-            SemanticGraphStore::parse_rdf_triples(&body_bytes, rdf_fmt, &child_iri)?
+            let parsed =
+                SemanticGraphStore::parse_rdf_triples(&body_bytes, rdf_fmt, &ext_child_iri)?;
+            child_target.rebase_triples_for_storage(&state.config.base_url, parsed)
         };
         reject_client_contains_triples(&triples)?;
         state
@@ -716,8 +784,10 @@ async fn handle_post(
         match raw_ct.as_deref() {
             Some(ct) if !requested_non_rdf && parse_rdf_media_type(ct).is_some() => {
                 let rdf_fmt = parse_rdf_media_type(ct).unwrap();
+                let parsed =
+                    SemanticGraphStore::parse_rdf_triples(&body_bytes, rdf_fmt, &ext_child_iri)?;
                 let triples =
-                    SemanticGraphStore::parse_rdf_triples(&body_bytes, rdf_fmt, &child_iri)?;
+                    child_target.rebase_triples_for_storage(&state.config.base_url, parsed);
                 state
                     .graph_store
                     .replace_named_graph_triples(&child_iri, &triples)?;
@@ -730,11 +800,13 @@ async fn handle_post(
                 )
             }
             None if requested_rdf_source => {
-                let triples = SemanticGraphStore::parse_rdf_triples(
+                let parsed = SemanticGraphStore::parse_rdf_triples(
                     &body_bytes,
                     RdfFormat::Turtle,
-                    &child_iri,
+                    &ext_child_iri,
                 )?;
+                let triples =
+                    child_target.rebase_triples_for_storage(&state.config.base_url, parsed);
                 state
                     .graph_store
                     .replace_named_graph_triples(&child_iri, &triples)?;
@@ -790,7 +862,7 @@ async fn handle_post(
     drop(_io_guard);
 
     let mut resp = StatusCode::CREATED.into_response();
-    if let Ok(loc) = HeaderValue::from_str(&child_iri) {
+    if let Ok(loc) = HeaderValue::from_str(&ext_child_iri) {
         resp.headers_mut().insert(header::LOCATION, loc);
     }
     attach_ldp_headers(
@@ -841,7 +913,8 @@ async fn handle_patch(
     }
 
     let resource_iri = http_iri(&state.config.base_url, &target.canonical_path);
-    let parsed_update = SparqlUpdate::parse(sparql_text, Some(&resource_iri))
+    let ext_resource_iri = target.external_iri(&state.config.base_url, &target.canonical_path);
+    let parsed_update = SparqlUpdate::parse(sparql_text, Some(&ext_resource_iri))
         .map_err(|e| LdpError::BadRequest(format!("Invalid SPARQL-Update syntax: {e}")))?;
 
     let patch_profile = classify_sparql_update(&parsed_update)?;
@@ -871,7 +944,10 @@ async fn handle_patch(
                     .to_string(),
             ));
         }
-        Some(_) => state.graph_store.get_named_graph_triples(&resource_iri)?,
+        Some(_) => {
+            let stored = state.graph_store.get_named_graph_triples(&resource_iri)?;
+            target.rebase_triples_for_response(&state.config.base_url, stored)
+        }
         None => {
             if target.is_container_path || patch_profile.requires_write {
                 return Err(LdpError::NotFound(format!(
@@ -906,7 +982,7 @@ async fn handle_patch(
         ));
     }
 
-    let mut updated_triples = Vec::new();
+    let mut sandbox_triples = Vec::new();
     for quad_res in sandbox.inner().quads_for_pattern(
         None,
         None,
@@ -915,8 +991,10 @@ async fn handle_patch(
     ) {
         let quad =
             quad_res.map_err(|e| LdpError::Internal(format!("Sandbox quad read failed: {e}")))?;
-        updated_triples.push(Triple::from(quad));
+        sandbox_triples.push(Triple::from(quad));
     }
+    let updated_triples =
+        target.rebase_triples_for_storage(&state.config.base_url, sandbox_triples);
 
     if target.is_container_path {
         reject_client_contains_triples(&updated_triples)?;
@@ -977,7 +1055,7 @@ async fn handle_patch(
     };
     let mut resp = status.into_response();
     if status == StatusCode::CREATED {
-        if let Ok(loc) = HeaderValue::from_str(&resource_iri) {
+        if let Ok(loc) = HeaderValue::from_str(&ext_resource_iri) {
             resp.headers_mut().insert(header::LOCATION, loc);
         }
     }
@@ -1193,19 +1271,39 @@ fn attach_ldp_headers(
     kind: ResourceKind,
     etag: Option<&str>,
 ) -> Result<(), LdpError> {
-    let acl_iri = http_iri(&state.config.base_url, &target.acl_path);
-    let link_value = match kind {
-        ResourceKind::Container => format!(
-            "<{LDP_BASIC_CONTAINER}>; rel=\"type\", <{LDP_CONTAINER}>; rel=\"type\", <{LDP_RESOURCE}>; rel=\"type\", <{acl_iri}>; rel=\"acl\""
-        ),
-        ResourceKind::RdfSource => format!(
-            "<{LDP_RDF_SOURCE}>; rel=\"type\", <{LDP_RESOURCE}>; rel=\"type\", <{acl_iri}>; rel=\"acl\""
-        ),
-        ResourceKind::NonRdfSource => format!(
-            "<{LDP_NON_RDF_SOURCE}>; rel=\"type\", <{LDP_RESOURCE}>; rel=\"type\", <{acl_iri}>; rel=\"acl\""
-        ),
+    let acl_iri = target.external_iri(&state.config.base_url, &target.acl_path);
+    let mut link_parts = match kind {
+        ResourceKind::Container => {
+            let mut v = vec![
+                format!("<{LDP_BASIC_CONTAINER}>; rel=\"type\""),
+                format!("<{LDP_CONTAINER}>; rel=\"type\""),
+                format!("<{LDP_RESOURCE}>; rel=\"type\""),
+            ];
+            if target.canonical_path == "/" || is_pod_root_path(&target.canonical_path) {
+                v.push(format!("<{PIM_STORAGE}>; rel=\"type\""));
+            }
+            v
+        }
+        ResourceKind::RdfSource => vec![
+            format!("<{LDP_RDF_SOURCE}>; rel=\"type\""),
+            format!("<{LDP_RESOURCE}>; rel=\"type\""),
+        ],
+        ResourceKind::NonRdfSource => vec![
+            format!("<{LDP_NON_RDF_SOURCE}>; rel=\"type\""),
+            format!("<{LDP_RESOURCE}>; rel=\"type\""),
+        ],
     };
+    link_parts.push(format!("<{acl_iri}>; rel=\"acl\""));
 
+    if let Some(pod_id) = enclosing_pod_id(&target.canonical_path) {
+        let pod_root_canonical = format!("/pods/{pod_id}/");
+        let ext_pod_root = target.external_iri(&state.config.base_url, &pod_root_canonical);
+        let ext_inbox = format!("{ext_pod_root}inbox/");
+        link_parts.push(format!("<{ext_pod_root}>; rel=\"{PIM_STORAGE_REL}\""));
+        link_parts.push(format!("<{ext_inbox}>; rel=\"{LDP_INBOX_REL}\""));
+    }
+
+    let link_value = link_parts.join(", ");
     let link_hdr = HeaderValue::from_str(&link_value)
         .map_err(|e| LdpError::Internal(format!("Invalid Link header value: {e}")))?;
     headers.insert(header::LINK, link_hdr);
@@ -1222,7 +1320,7 @@ fn attach_ldp_headers(
     headers.insert(header::ALLOW, HeaderValue::from_static(allow));
     headers.insert(
         header::VARY,
-        HeaderValue::from_static("Accept, Authorization"),
+        HeaderValue::from_static("Accept, Authorization, Host"),
     );
 
     if matches!(kind, ResourceKind::Container | ResourceKind::RdfSource) {
@@ -1280,13 +1378,37 @@ fn compute_wac_allow(state: &AppState, principal: &Principal, target: &ResourceU
     format!("user=\"{user_modes}\",public=\"{public_modes}\"")
 }
 
-fn parse_ldp_target(uri: &Uri, pod_prefix: &str) -> Result<LdpTarget, LdpError> {
+fn parse_ldp_target(
+    uri: &Uri,
+    headers: &HeaderMap,
+    config: &LdpConfig,
+) -> Result<LdpTarget, LdpError> {
     if uri.query().is_some() {
         return Err(LdpError::BadRequest(
             "Query parameters are not permitted on Solid LDP resource URIs".to_string(),
         ));
     }
-    parse_ldp_path_str(uri.path(), pod_prefix)
+
+    if let Some((pod_id, sub_origin)) = extract_subdomain_pod(headers, uri, config)? {
+        let rewritten = rewrite_subdomain_path(uri.path(), &pod_id)?;
+        let mut target = parse_ldp_path_str(&rewritten, &config.pod_uri_prefix)?;
+        target.subdomain_ctx = Some((pod_id, sub_origin));
+        return Ok(target);
+    }
+
+    parse_ldp_path_str(uri.path(), &config.pod_uri_prefix)
+}
+
+fn rewrite_subdomain_path(raw_path: &str, pod_id: &str) -> Result<String, LdpError> {
+    if raw_path.is_empty() || !raw_path.starts_with('/') || raw_path.len() > MAX_URI_LEN {
+        return Err(LdpError::BadRequest(
+            "Invalid LDP URI path length or missing leading '/'".to_string(),
+        ));
+    }
+    if raw_path == "/" {
+        return Ok(format!("/pods/{pod_id}/"));
+    }
+    Ok(format!("/pods/{pod_id}{raw_path}"))
 }
 
 fn parse_ldp_path_str(raw_path: &str, pod_prefix: &str) -> Result<LdpTarget, LdpError> {
@@ -1330,12 +1452,16 @@ fn parse_ldp_path_str(raw_path: &str, pod_prefix: &str) -> Result<LdpTarget, Ldp
             ));
         }
         let decoded = decode_uri_segment(seg)?;
+        if decoded == RESERVED_META_SEG || decoded.starts_with("__wolin_") {
+            return Err(LdpError::BadRequest(format!(
+                "Reserved metadata path segment '{decoded}' cannot be accessed via LDP"
+            )));
+        }
         if idx == 0
-            && (decoded == RESERVED_META_SEG
-                || decoded.starts_with("__wolin_")
-                || decoded == ".well-known"
+            && (decoded == ".well-known"
                 || decoded == "health"
-                || decoded == "mcp")
+                || decoded == "mcp"
+                || decoded == "api")
         {
             return Err(LdpError::BadRequest(format!(
                 "Reserved system path segment '{decoded}' cannot be accessed via LDP"
@@ -1364,7 +1490,7 @@ fn parse_ldp_path_str(raw_path: &str, pod_prefix: &str) -> Result<LdpTarget, Ldp
     Ok(build_ldp_target_from_canonical(&canonical, pod_prefix))
 }
 
-fn build_ldp_target_from_canonical(canonical_path: &str, pod_prefix: &str) -> LdpTarget {
+pub(crate) fn build_ldp_target_from_canonical(canonical_path: &str, pod_prefix: &str) -> LdpTarget {
     let clean_prefix = pod_prefix.trim_end_matches('/');
 
     if canonical_path == "/" {
@@ -1379,6 +1505,7 @@ fn build_ldp_target_from_canonical(canonical_path: &str, pod_prefix: &str) -> Ld
             is_acl: false,
             acl_path: "/.acl".to_string(),
             policy_target: ResourceUri(policy_uri),
+            subdomain_ctx: None,
         };
     }
 
@@ -1394,6 +1521,7 @@ fn build_ldp_target_from_canonical(canonical_path: &str, pod_prefix: &str) -> Ld
             is_acl: true,
             acl_path: "/.acl".to_string(),
             policy_target: ResourceUri(policy_uri),
+            subdomain_ctx: None,
         };
     }
 
@@ -1406,6 +1534,7 @@ fn build_ldp_target_from_canonical(canonical_path: &str, pod_prefix: &str) -> Ld
             is_acl: true,
             acl_path: canonical_path.to_string(),
             policy_target: ResourceUri(policy_uri),
+            subdomain_ctx: None,
         };
     }
 
@@ -1418,6 +1547,7 @@ fn build_ldp_target_from_canonical(canonical_path: &str, pod_prefix: &str) -> Ld
             is_acl: true,
             acl_path: canonical_path.to_string(),
             policy_target: ResourceUri(policy_uri),
+            subdomain_ctx: None,
         };
     }
 
@@ -1429,6 +1559,7 @@ fn build_ldp_target_from_canonical(canonical_path: &str, pod_prefix: &str) -> Ld
             is_acl: false,
             acl_path: format!("{canonical_path}.acl"),
             policy_target: ResourceUri(format!("{clean_prefix}{trimmed}")),
+            subdomain_ctx: None,
         }
     } else {
         LdpTarget {
@@ -1437,8 +1568,82 @@ fn build_ldp_target_from_canonical(canonical_path: &str, pod_prefix: &str) -> Ld
             is_acl: false,
             acl_path: format!("{canonical_path}.acl"),
             policy_target: ResourceUri(format!("{clean_prefix}{canonical_path}")),
+            subdomain_ctx: None,
         }
     }
+}
+
+fn is_pod_root_path(canonical_path: &str) -> bool {
+    let Some(rest) = canonical_path.strip_prefix("/pods/") else {
+        return false;
+    };
+    let Some(pod_id) = rest.strip_suffix('/') else {
+        return false;
+    };
+    !pod_id.is_empty() && !pod_id.contains('/') && !pod_id.ends_with(".acl")
+}
+
+fn enclosing_pod_id(canonical_path: &str) -> Option<&str> {
+    let rest = canonical_path.strip_prefix("/pods/")?;
+    let (first_seg, _tail) = rest.split_once('/')?;
+    if first_seg.is_empty() || first_seg.ends_with(".acl") {
+        None
+    } else {
+        Some(first_seg)
+    }
+}
+
+fn rebase_iri_str(iri: &str, from_prefix: &str, to_prefix: &str) -> Option<String> {
+    if let Some(rest) = iri.strip_prefix(from_prefix) {
+        Some(format!("{to_prefix}{rest}"))
+    } else if iri == from_prefix.trim_end_matches('/') {
+        Some(to_prefix.trim_end_matches('/').to_string())
+    } else {
+        None
+    }
+}
+
+fn rebase_triples(triples: Vec<Triple>, from_prefix: &str, to_prefix: &str) -> Vec<Triple> {
+    triples
+        .into_iter()
+        .map(|t| rebase_single_triple(t, from_prefix, to_prefix))
+        .collect()
+}
+
+fn rebase_single_triple(t: Triple, from_prefix: &str, to_prefix: &str) -> Triple {
+    let subject = match t.subject {
+        Subject::NamedNode(n) => match rebase_iri_str(n.as_str(), from_prefix, to_prefix) {
+            Some(new_iri) => NamedNode::new(new_iri)
+                .map(Subject::NamedNode)
+                .unwrap_or(Subject::NamedNode(n)),
+            None => Subject::NamedNode(n),
+        },
+        Subject::Triple(inner) => Subject::Triple(Box::new(rebase_single_triple(
+            *inner,
+            from_prefix,
+            to_prefix,
+        ))),
+        other => other,
+    };
+    let predicate = match rebase_iri_str(t.predicate.as_str(), from_prefix, to_prefix) {
+        Some(new_iri) => NamedNode::new(new_iri).unwrap_or(t.predicate),
+        None => t.predicate,
+    };
+    let object = match t.object {
+        Term::NamedNode(n) => match rebase_iri_str(n.as_str(), from_prefix, to_prefix) {
+            Some(new_iri) => NamedNode::new(new_iri)
+                .map(Term::NamedNode)
+                .unwrap_or(Term::NamedNode(n)),
+            None => Term::NamedNode(n),
+        },
+        Term::Triple(inner) => Term::Triple(Box::new(rebase_single_triple(
+            *inner,
+            from_prefix,
+            to_prefix,
+        ))),
+        other => other,
+    };
+    Triple::new(subject, predicate, object)
 }
 
 fn is_acl_canonical_path(path: &str) -> bool {
@@ -1509,7 +1714,7 @@ fn hex_nibble(b: u8) -> Result<u8, LdpError> {
     }
 }
 
-fn http_iri(base_url: &str, canonical_path: &str) -> String {
+pub(crate) fn http_iri(base_url: &str, canonical_path: &str) -> String {
     const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
     let base = base_url.trim_end_matches('/');
     if canonical_path == "/" {
@@ -1557,7 +1762,7 @@ fn http_iri(base_url: &str, canonical_path: &str) -> String {
     encoded
 }
 
-fn blob_key_for_path(canonical_path: &str) -> String {
+pub(crate) fn blob_key_for_path(canonical_path: &str) -> String {
     format!("blobs/{}", canonical_path.trim_start_matches('/'))
 }
 
@@ -2088,7 +2293,7 @@ fn if_none_match_satisfied(headers: &HeaderMap, current_etag: &str) -> bool {
             .any(|tok| tok.trim().trim_start_matches("W/") == current_etag)
 }
 
-fn compute_etag(bytes: &[u8]) -> String {
+pub(crate) fn compute_etag(bytes: &[u8]) -> String {
     // Deterministic 128-bit dual FNV-1a content fingerprint formatted as a strong HTTP ETag.
     let mut h1: u64 = 0xcbf29ce484222325;
     let mut h2: u64 = 0x84222325cbf29ce4;
@@ -2101,7 +2306,7 @@ fn compute_etag(bytes: &[u8]) -> String {
     format!("\"{h1:016x}{h2:016x}-{:x}\"", bytes.len())
 }
 
-fn acl_rule_prefix(acl_canonical_path: &str) -> String {
+pub(crate) fn acl_rule_prefix(acl_canonical_path: &str) -> String {
     format!("acl-doc:{acl_canonical_path}#")
 }
 
@@ -2132,7 +2337,7 @@ pub(crate) fn rehydrate_persisted_acl_rules(
     Ok(())
 }
 
-fn extract_wac_rules_from_acl_triples(
+pub(crate) fn extract_wac_rules_from_acl_triples(
     config: &crate::LdpConfig,
     acl_target: &LdpTarget,
     triples: &[Triple],

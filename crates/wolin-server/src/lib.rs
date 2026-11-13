@@ -4,6 +4,7 @@ pub mod auth;
 pub mod error;
 pub mod ldp;
 pub mod mcp;
+pub mod pods;
 
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -18,7 +19,10 @@ use axum::{
 use ldp::LdpCatalog;
 use serde_json::json;
 use tower_http::trace::{DefaultMakeSpan, TraceLayer};
-use wolin_identity::{JwtSignatureVerifier, OidcValidationOptions};
+use wolin_identity::{
+    DpopReplayCache, HttpWebIdDereferencer, JwtSignatureVerifier, OidcValidationOptions,
+    WebIdDereferencer,
+};
 use wolin_mcp::{DisclosurePolicy, McpAgentServer, McpGatewayConfig};
 use wolin_policy::PolicyEngine;
 use wolin_storage::{PhysicalStore, SemanticGraphStore};
@@ -40,10 +44,17 @@ pub struct LdpConfig {
     pub max_body_bytes: usize,
     /// Optional deterministic UNIX epoch timestamp override for policy evaluation in tests.
     pub policy_clock_epoch_secs: Option<i64>,
+    /// Sovereign Pod Cloud root domain for Host-header subdomain routing (`{pod_id}.{pod_cloud_domain}`).
+    pub pod_cloud_domain: String,
+    /// Optional Solid-OIDC external WebID RDF Profile dereferencer.
+    pub webid_dereferencer: Option<Arc<dyn WebIdDereferencer>>,
 }
 
 impl Default for LdpConfig {
     fn default() -> Self {
+        let default_deref = HttpWebIdDereferencer::new()
+            .ok()
+            .map(|d| Arc::new(d) as Arc<dyn WebIdDereferencer>);
         Self {
             base_url: "http://127.0.0.1:4000".to_string(),
             pod_uri_prefix: "wolin://pod".to_string(),
@@ -51,6 +62,8 @@ impl Default for LdpConfig {
             jwt_verifier: None,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             policy_clock_epoch_secs: None,
+            pod_cloud_domain: "wolin.cloud".to_string(),
+            webid_dereferencer: default_deref,
         }
     }
 }
@@ -83,6 +96,21 @@ impl LdpConfig {
         self.policy_clock_epoch_secs = Some(epoch_secs);
         self
     }
+
+    pub fn with_pod_cloud_domain(mut self, domain: impl Into<String>) -> Self {
+        self.pod_cloud_domain = domain.into().trim().trim_matches('.').to_ascii_lowercase();
+        self
+    }
+
+    pub fn with_webid_dereferencer(mut self, dereferencer: Arc<dyn WebIdDereferencer>) -> Self {
+        self.webid_dereferencer = Some(dereferencer);
+        self
+    }
+
+    pub fn without_webid_dereferencer(mut self) -> Self {
+        self.webid_dereferencer = None;
+        self
+    }
 }
 
 /// Shared application state across Axum Solid LDP, Native MCP, and system discovery endpoints.
@@ -94,6 +122,7 @@ pub struct AppState {
     pub catalog_lock: Arc<tokio::sync::RwLock<()>>,
     pub catalog: tokio::sync::RwLock<LdpCatalog>,
     pub mcp_server: McpAgentServer,
+    pub dpop_replay_cache: Arc<DpopReplayCache>,
     pub config: LdpConfig,
 }
 
@@ -136,6 +165,7 @@ impl AppState {
             catalog_lock,
             catalog: tokio::sync::RwLock::new(catalog),
             mcp_server,
+            dpop_replay_cache: Arc::new(DpopReplayCache::new(8_192)),
             config,
         }))
     }
@@ -227,6 +257,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health_check))
         .route("/.well-known/wolin", get(well_known_wolin))
+        .route("/api/pods", post(pods::handle_provision_pod))
+        .route("/api/pods/{pod_id}", get(pods::handle_get_pod_info))
         .route("/mcp", post(mcp::handle_mcp_post))
         .route("/mcp/sse", get(mcp::handle_mcp_sse))
         .fallback(ldp::handle_ldp_request)
@@ -266,11 +298,14 @@ pub async fn well_known_wolin(State(state): State<Arc<AppState>>) -> Json<serde_
             "discovery": "/.well-known/wolin",
             "ldp_root": "/",
             "pods": "/pods/",
+            "pod_provisioning": "/api/pods",
             "mcp": "/mcp",
             "mcp_sse": "/mcp/sse"
         },
         "capabilities": {
             "solid_ldp": true,
+            "solid_oidc_dpop": true,
+            "multi_tenant_pod_cloud": true,
             "wac_acp_pdp": true,
             "mcp_jsonrpc": true,
             "mcp_sse": true,
@@ -288,6 +323,7 @@ pub struct ServerCliConfig {
     pub storage_dir: Option<PathBuf>,
     pub base_url: Option<String>,
     pub pod_uri_prefix: String,
+    pub pod_cloud_domain: String,
     pub oidc_issuer: String,
     pub oidc_audience: Option<String>,
     pub owner_webid: Option<String>,
@@ -303,6 +339,7 @@ impl Default for ServerCliConfig {
             storage_dir: None,
             base_url: None,
             pod_uri_prefix: "wolin://pod".to_string(),
+            pod_cloud_domain: "wolin.cloud".to_string(),
             oidc_issuer: "https://auth.wolin.id".to_string(),
             oidc_audience: None,
             owner_webid: None,
@@ -343,6 +380,7 @@ impl ServerCliConfig {
                -d, --storage-dir <DIR>         Persistent storage root (omit for ephemeral in-memory)\n  \
                --base-url <URL>                Public canonical Pod base URL\n  \
                --pod-prefix <URI>              Canonical PDP Pod URI prefix (default: wolin://pod)\n  \
+               --pod-cloud-domain <DOMAIN>     Multi-tenant subdomain root (default: wolin.cloud)\n  \
                --oidc-issuer <URL>             Expected OIDC / ZITADEL token issuer\n  \
                --oidc-audience <AUD>           Optional required OIDC token audience\n  \
                --owner-webid <WEBID_OR_DID>    Bootstrap full WAC owner access on Pod root\n  \
@@ -407,6 +445,14 @@ impl ServerCliConfig {
                         return Err("--pod-prefix must not be empty".to_string());
                     }
                     cfg.pod_uri_prefix = val.trim_end_matches('/').to_string();
+                }
+                "--pod-cloud-domain" => {
+                    let val = next_val(&mut iter, "--pod-cloud-domain")?;
+                    let clean = val.trim().trim_matches('.').to_ascii_lowercase();
+                    if clean.is_empty() {
+                        return Err("--pod-cloud-domain must not be empty".to_string());
+                    }
+                    cfg.pod_cloud_domain = clean;
                 }
                 "--oidc-issuer" => {
                     let val = next_val(&mut iter, "--oidc-issuer")?;

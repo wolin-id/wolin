@@ -48,6 +48,13 @@ pub struct ActorClaim {
     pub act: Option<serde_json::Value>,
 }
 
+/// RFC 7800 / RFC 9449 Proof-of-Possession `cnf` confirmation claim (`{"jkt": "..."}`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfirmationClaim {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jkt: Option<String>,
+}
+
 /// Validated / normalized OIDC & ZITADEL token claims
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OidcClaims {
@@ -63,6 +70,8 @@ pub struct OidcClaims {
     pub act: Option<ActorClaim>,
     pub delegated_by: Option<String>,
     pub org_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cnf: Option<ConfirmationClaim>,
 }
 
 /// Validation parameters for enterprise OIDC / ZITADEL tokens
@@ -158,6 +167,8 @@ struct RawOidcClaims {
     delegated_by: Option<String>,
     #[serde(default, rename = "urn:zitadel:iam:org:id")]
     org_id: Option<String>,
+    #[serde(default)]
+    cnf: Option<ConfirmationClaim>,
 }
 
 pub struct OidcValidator;
@@ -180,6 +191,7 @@ impl OidcValidator {
     ) -> Result<Principal> {
         let envelope = Self::decode_jwt_envelope(token)?;
         let claims = Self::decode_jwt_payload(envelope.payload_b64)?;
+        reject_dpop_bound_token_without_proof(&claims)?;
         Self::validate_parsed_claims(&claims, options)
     }
 
@@ -199,6 +211,7 @@ impl OidcValidator {
             &envelope.signature,
         )?;
         let claims = Self::decode_jwt_payload(envelope.payload_b64)?;
+        reject_dpop_bound_token_without_proof(&claims)?;
         Self::validate_parsed_claims(&claims, options)
     }
 
@@ -206,6 +219,133 @@ impl OidcValidator {
     pub fn parse_jwt_claims(token: &str) -> Result<OidcClaims> {
         let envelope = Self::decode_jwt_envelope(token)?;
         Self::decode_jwt_payload(envelope.payload_b64)
+    }
+
+    /// Validate a Solid-OIDC Bearer or DPoP token, performing external WebID Profile RDF
+    /// dereferencing and `<webid> solid:oidcIssuer <iss>` verification when required.
+    pub async fn validate_solid_oidc(
+        token: &str,
+        options: &OidcValidationOptions,
+        verifier: Option<&dyn JwtSignatureVerifier>,
+        dereferencer: Option<&dyn crate::solid_oidc::WebIdDereferencer>,
+        dpop_proof_and_ctx: Option<(&str, &crate::solid_oidc::DpopValidationContext<'_>)>,
+    ) -> Result<Principal> {
+        let envelope = Self::decode_jwt_envelope(token)?;
+        if let Some(v) = verifier {
+            let signing_input = format!("{}.{}", envelope.header_b64, envelope.payload_b64);
+            v.verify(
+                &envelope.header.alg,
+                envelope.header.kid.as_deref(),
+                signing_input.as_bytes(),
+                &envelope.signature,
+            )?;
+        }
+
+        let claims = Self::decode_jwt_payload(envelope.payload_b64)?;
+
+        match dpop_proof_and_ctx {
+            Some((dpop_jwt, dpop_ctx)) => {
+                let proof = crate::solid_oidc::verify_dpop_proof(dpop_jwt, dpop_ctx)?;
+                let expected_jkt = claims
+                    .cnf
+                    .as_ref()
+                    .and_then(|c| c.jkt.as_deref())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        WolinError::Unauthenticated(
+                            "DPoP access token missing required 'cnf.jkt' key-binding claim"
+                                .to_string(),
+                        )
+                    })?;
+                if expected_jkt != proof.jkt {
+                    return Err(WolinError::Unauthenticated(
+                        "DPoP proof JWK thumbprint does not match token 'cnf.jkt' claim"
+                            .to_string(),
+                    ));
+                }
+            }
+            None => {
+                reject_dpop_bound_token_without_proof(&claims)?;
+            }
+        }
+
+        // Fast path: local configured OIDC issuer with same-org WebID or DID principal.
+        if claims.iss == options.expected_issuer.trim() {
+            if let Ok(local_principal) = Self::validate_parsed_claims(&claims, options) {
+                return Ok(local_principal);
+            }
+        }
+
+        // Federated Solid-OIDC path: validate core claims + dereference WebID RDF Profile.
+        let Some(deref) = dereferencer else {
+            return Self::validate_parsed_claims(&claims, options);
+        };
+
+        validate_solid_oidc_temporal_and_aud_claims(&claims, options)?;
+
+        if !is_valid_solid_issuer_uri(&claims.iss) {
+            return Err(WolinError::Unauthenticated(
+                "Solid-OIDC 'iss' claim must be a valid HTTP(S) URI without userinfo, query, or fragment"
+                    .to_string(),
+            ));
+        }
+
+        if let Some(ref act) = claims.act {
+            if act.act.is_some() {
+                return Err(WolinError::Unauthenticated(
+                    "Nested multi-hop RFC 8693 'act' chains are rejected".to_string(),
+                ));
+            }
+        }
+
+        let raw_webid = if let Some(ref delegator) = claims.delegated_by {
+            delegator.trim()
+        } else if let Some(ref explicit_webid) = claims.webid {
+            explicit_webid.trim()
+        } else {
+            let sub_trimmed = claims.sub.trim();
+            if sub_trimmed.starts_with("https://") || sub_trimmed.starts_with("http://") {
+                sub_trimmed
+            } else {
+                return Err(WolinError::Unauthenticated(
+                    "External Solid-OIDC token missing dereferenceable HTTP(S) 'webid' claim"
+                        .to_string(),
+                ));
+            }
+        };
+
+        if !(raw_webid.starts_with("https://") || raw_webid.starts_with("http://")) {
+            return Err(WolinError::Unauthenticated(
+                "External Solid-OIDC 'webid' claim must be an HTTP(S) URI".to_string(),
+            ));
+        }
+
+        let profile = deref.dereference(raw_webid).await?;
+        profile.verify_oidc_issuer(&claims.iss)?;
+
+        if claims.delegated_by.is_some() || claims.act.is_some() {
+            let raw_agent = match claims.act {
+                Some(ref act) => act.sub.trim(),
+                None => claims.sub.trim(),
+            };
+            if raw_agent.is_empty() {
+                return Err(WolinError::Unauthenticated(
+                    "Delegated agent identifier cannot be empty".to_string(),
+                ));
+            }
+            let agent_id = canonicalize_did_if_did(raw_agent)?;
+            Ok(Principal::Agent {
+                agent_id,
+                delegated_by: WebId(raw_webid.to_string()),
+                scope: claims.scopes.clone(),
+            })
+        } else {
+            Ok(Principal::User {
+                webid: WebId(raw_webid.to_string()),
+                issuer: claims.iss.clone(),
+            })
+        }
     }
 
     /// Validate pre-parsed `OidcClaims` and map to `Principal::User` or `Principal::Agent`.
@@ -437,6 +577,7 @@ fn normalize_raw_claims(raw: RawOidcClaims) -> Result<OidcClaims> {
         act: raw.act,
         delegated_by: raw.delegated_by,
         org_id: raw.org_id,
+        cnf: raw.cnf,
     })
 }
 
@@ -678,10 +819,7 @@ fn org_root_domain(host: &str) -> Option<String> {
     for cloud_suffix in SHARED_MULTI_TENANT_CLOUD_SUFFIXES {
         if host == *cloud_suffix
             || (host.ends_with(cloud_suffix)
-                && host
-                    .as_bytes()
-                    .get(host.len() - cloud_suffix.len() - 1)
-                    == Some(&b'.'))
+                && host.as_bytes().get(host.len() - cloud_suffix.len() - 1) == Some(&b'.'))
         {
             return None;
         }
@@ -719,6 +857,107 @@ fn current_epoch_secs() -> Result<i64> {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .map_err(|e| WolinError::Internal(format!("System clock before UNIX_EPOCH: {e}")))
+}
+
+fn validate_solid_oidc_temporal_and_aud_claims(
+    claims: &OidcClaims,
+    options: &OidcValidationOptions,
+) -> Result<()> {
+    if options.clock_skew_leeway_secs < 0 {
+        return Err(WolinError::InvalidFormat(
+            "Clock skew leeway must be non-negative".to_string(),
+        ));
+    }
+    if claims.iss.trim().is_empty() {
+        return Err(WolinError::Unauthenticated(
+            "Solid-OIDC 'iss' claim must not be empty".to_string(),
+        ));
+    }
+    if claims.sub.trim().is_empty() {
+        return Err(WolinError::Unauthenticated(
+            "Solid-OIDC 'sub' claim must not be empty".to_string(),
+        ));
+    }
+    if claims.aud.is_empty() || claims.aud.iter().any(|a| a.trim().is_empty()) {
+        return Err(WolinError::Unauthenticated(
+            "Solid-OIDC 'aud' claim must be non-empty".to_string(),
+        ));
+    }
+    if let Some(ref expected_aud) = options.expected_audience {
+        let matches_expected_or_solid =
+            claims.aud.iter().any(|a| a == expected_aud || a == "solid");
+        if !matches_expected_or_solid {
+            return Err(WolinError::Unauthenticated(format!(
+                "Solid-OIDC audience mismatch: expected '{expected_aud}' or 'solid'"
+            )));
+        }
+    }
+
+    let now = match options.now_epoch_secs {
+        Some(ts) => ts,
+        None => current_epoch_secs()?,
+    };
+    let leeway = options.clock_skew_leeway_secs;
+
+    if claims.exp <= 0 || now >= claims.exp.saturating_add(leeway) {
+        return Err(WolinError::Unauthenticated(
+            "OIDC token has expired".to_string(),
+        ));
+    }
+    if let Some(nbf) = claims.nbf {
+        if now.saturating_add(leeway) < nbf {
+            return Err(WolinError::Unauthenticated(
+                "OIDC token is not yet valid (nbf)".to_string(),
+            ));
+        }
+    }
+    if let Some(iat) = claims.iat {
+        if claims.exp <= iat {
+            return Err(WolinError::Unauthenticated(
+                "OIDC token expiration (exp) must be greater than issued-at (iat)".to_string(),
+            ));
+        }
+        if iat > now.saturating_add(leeway) {
+            return Err(WolinError::Unauthenticated(
+                "OIDC token issued-at (iat) is in the future".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn is_valid_solid_issuer_uri(iss: &str) -> bool {
+    if iss.is_empty()
+        || iss.len() > 2048
+        || iss
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control() || b == b'\\')
+    {
+        return false;
+    }
+    let Ok(url) = reqwest::Url::parse(iss) else {
+        return false;
+    };
+    matches!(url.scheme(), "https" | "http")
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+}
+
+pub(crate) fn base64url_decode_segment(input: &str) -> Result<Vec<u8>> {
+    base64url_decode(input)
+}
+
+fn reject_dpop_bound_token_without_proof(claims: &OidcClaims) -> Result<()> {
+    if claims.cnf.is_some() {
+        return Err(WolinError::Unauthenticated(
+            "DPoP-bound access token ('cnf') cannot be used without a verified DPoP proof"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Strict RFC 7515 §2 canonical unpadded Base64URL decoder (rejects `=` padding and non-zero pad bits).
@@ -818,6 +1057,7 @@ mod tests {
             }),
             delegated_by: Some("did:web:wolin.id:users:%61lice".to_string()),
             org_id: None,
+            cnf: None,
         };
         let opts = OidcValidationOptions::new("https://zitadel.wolin.id")
             .with_audience("wolin-mcp")
@@ -848,6 +1088,7 @@ mod tests {
             act: None,
             delegated_by: None,
             org_id: None,
+            cnf: None,
         };
 
         // 1. userinfo@host authority confusion
@@ -999,6 +1240,7 @@ mod tests {
             }),
             delegated_by: None,
             org_id: None,
+            cnf: None,
         };
         let wolin_opts =
             OidcValidationOptions::new("https://zitadel.wolin.id").with_now(2_000_000_100);
@@ -1020,6 +1262,7 @@ mod tests {
             act: None,
             delegated_by: None,
             org_id: None,
+            cnf: None,
         };
         let opts = OidcValidationOptions::new("https://zitadel.wolin.id").with_now(2_000_000_100);
         assert!(OidcValidator::validate_parsed_claims(&claims, &opts).is_err());

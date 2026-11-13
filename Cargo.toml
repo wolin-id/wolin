@@ -44,6 +44,10 @@ anyhow = "1.0"
 oxigraph = "0.4"
 opendal = { version = "0.51", features = ["services-fs", "services-memory"] }
 
+# Crypto & Federated HTTP
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "stream"] }
+ring = "0.17"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

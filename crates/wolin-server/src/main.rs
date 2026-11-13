@@ -73,6 +73,7 @@ async fn main() -> anyhow::Result<()> {
 
     let base_url = cli_cfg.effective_base_url();
     let ldp_config = LdpConfig::new(&base_url, &cli_cfg.pod_uri_prefix)
+        .with_pod_cloud_domain(&cli_cfg.pod_cloud_domain)
         .with_oidc_options(oidc_opts)
         .with_max_body_bytes(cli_cfg.max_body_bytes);
 
