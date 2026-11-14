@@ -1,8 +1,8 @@
-use axum::http::{header, HeaderMap, Method, Uri};
+use axum::http::{HeaderMap, Method, Uri, header};
 use wolin_core::Principal;
 use wolin_identity::{DidResolver, DpopValidationContext, OidcValidator};
 
-use crate::{error::LdpError, pods::extract_subdomain_pod, AppState, LdpConfig};
+use crate::{AppState, LdpConfig, error::LdpError, pods::extract_subdomain_pod};
 
 const DEFAULT_DPOP_MAX_SKEW_SECS: i64 = 300;
 

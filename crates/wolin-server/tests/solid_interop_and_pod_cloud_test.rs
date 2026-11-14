@@ -1,34 +1,33 @@
 use std::sync::Arc;
 
 use axum::{
-    body::{to_bytes, Body},
+    Router,
+    body::{Body, to_bytes},
     extract::Path,
-    http::{header, Method, Request, StatusCode},
+    http::{Method, Request, StatusCode, header},
     response::IntoResponse,
     routing::get,
-    Router,
 };
 use ring::{
     rand::SystemRandom,
-    signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING},
+    signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair},
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::oneshot;
 use tower::ServiceExt;
 use wolin_identity::{
-    compute_jwk_thumbprint_sha256, sha256_base64url, HttpWebIdDereferencer, JwtSignatureVerifier,
-    OidcValidationOptions, WebIdDereferencer,
+    HttpWebIdDereferencer, JwtSignatureVerifier, OidcValidationOptions, WebIdDereferencer,
+    compute_jwk_thumbprint_sha256, sha256_base64url,
 };
 use wolin_policy::PolicyEngine;
 use wolin_server::{
-    build_router,
+    AppState, LdpConfig, build_router,
     ldp::{LDP_BASIC_CONTAINER, LDP_INBOX_REL, LDP_RESOURCE, PIM_STORAGE, PIM_STORAGE_REL},
-    AppState, LdpConfig,
 };
 use wolin_storage::{
-    rdf_io::RdfFormat,
-    rdf_model::{NamedNode, Subject, Term},
     SemanticGraphStore,
+    rdf_io::RdfFormat,
+    rdf_model::{NamedNode, NamedOrBlankNode, Term},
 };
 
 const LOCAL_WOLIN_ISSUER: &str = "https://auth.wolin.id";
@@ -260,10 +259,12 @@ async fn solid_oidc_external_webid_dereferencing_trust_chain_and_dpop_security()
     // Production HttpWebIdDereferencer MUST block plain HTTP loopback & metadata SSRF fail-closed
     let prod_deref = HttpWebIdDereferencer::new().expect("prod dereferencer");
     assert!(prod_deref.dereference(&alice_ext_webid).await.is_err());
-    assert!(prod_deref
-        .dereference("https://169.254.169.254/latest/meta-data#me")
-        .await
-        .is_err());
+    assert!(
+        prod_deref
+            .dereference("https://169.254.169.254/latest/meta-data#me")
+            .await
+            .is_err()
+    );
 
     // Loopback-enabled dereferencer for local integration harness
     let test_deref =
@@ -717,21 +718,21 @@ async fn dynamic_pod_provisioning_w3c_seed_resources_and_acl_matrix() {
     // Ensure `#injected` never materialized as a subject!
     assert!(!parsed_triples.iter().any(|t| matches!(
         &t.subject,
-        Subject::NamedNode(n) if n.as_str().ends_with("#injected")
+        NamedOrBlankNode::NamedNode(n) if n.as_str().ends_with("#injected")
     )));
     let me_iri = "http://pod.wolin.local/pods/alice-01/profile/card#me";
     assert!(parsed_triples.iter().any(|t| {
-        matches!(&t.subject, Subject::NamedNode(n) if n.as_str() == me_iri)
+        matches!(&t.subject, NamedOrBlankNode::NamedNode(n) if n.as_str() == me_iri)
             && t.predicate.as_str() == PIM_STORAGE_REL
             && matches!(&t.object, Term::NamedNode(o) if o.as_str() == "http://pod.wolin.local/pods/alice-01/")
     }));
     assert!(parsed_triples.iter().any(|t| {
-        matches!(&t.subject, Subject::NamedNode(n) if n.as_str() == me_iri)
+        matches!(&t.subject, NamedOrBlankNode::NamedNode(n) if n.as_str() == me_iri)
             && t.predicate.as_str() == "http://www.w3.org/ns/solid/terms#oidcIssuer"
             && matches!(&t.object, Term::NamedNode(o) if o.as_str() == LOCAL_WOLIN_ISSUER)
     }));
     assert!(parsed_triples.iter().any(|t| {
-        matches!(&t.subject, Subject::NamedNode(n) if n.as_str() == me_iri)
+        matches!(&t.subject, NamedOrBlankNode::NamedNode(n) if n.as_str() == me_iri)
             && t.predicate.as_str() == LDP_INBOX_REL
             && matches!(&t.object, Term::NamedNode(o) if o.as_str() == "http://pod.wolin.local/pods/alice-01/inbox/")
     }));
@@ -898,12 +899,11 @@ async fn inrupt_solid_client_simulation_discovery_and_dataset_crud() {
     let discovered_storage = triples
         .iter()
         .find_map(|t| {
-            if matches!(&t.subject, Subject::NamedNode(s) if s.as_str() == carol_webid)
+            if matches!(&t.subject, NamedOrBlankNode::NamedNode(s) if s.as_str() == carol_webid)
                 && t.predicate.as_str() == PIM_STORAGE_REL
+                && let Term::NamedNode(obj) = &t.object
             {
-                if let Term::NamedNode(obj) = &t.object {
-                    return Some(obj.as_str().to_string());
-                }
+                return Some(obj.as_str().to_string());
             }
             None
         })
@@ -1097,7 +1097,7 @@ async fn multi_tenant_subdomain_host_routing_and_cross_pod_isolation() {
     .unwrap();
     let sub_me = NamedNode::new("http://alice.wolin.cloud/profile/card#me").unwrap();
     assert!(sub_triples.iter().any(|t| {
-        t.subject == Subject::NamedNode(sub_me.clone())
+        t.subject == NamedOrBlankNode::NamedNode(sub_me.clone())
             && t.predicate.as_str() == PIM_STORAGE_REL
             && matches!(&t.object, Term::NamedNode(o) if o.as_str() == "http://alice.wolin.cloud/")
     }));

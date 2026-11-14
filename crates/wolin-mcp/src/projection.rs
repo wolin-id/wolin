@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use wolin_core::{Principal, WebId};
-use wolin_storage::rdf_model::{Literal, Subject, Term, Triple};
+use wolin_storage::rdf_model::{Literal, NamedOrBlankNode, Term, Triple};
 
 const MAX_QUOTED_TRIPLE_DEPTH: usize = 16;
 
@@ -169,28 +169,22 @@ fn project_single_triple(
         return None;
     }
 
-    if let Some(cat) = classify_pii_predicate(pred_iri, policy) {
-        if !profile.allowed_categories.contains(&cat) {
-            return None;
-        }
+    if let Some(cat) = classify_pii_predicate(pred_iri, policy)
+        && !profile.allowed_categories.contains(&cat)
+    {
+        return None;
     }
 
     let mut modified = false;
 
     let clean_subject = match &triple.subject {
-        Subject::NamedNode(n) => {
+        NamedOrBlankNode::NamedNode(n) => {
             if iri_violates_pii(n.as_str(), profile) {
                 return None;
             }
-            Subject::NamedNode(n.clone())
+            NamedOrBlankNode::NamedNode(n.clone())
         }
-        Subject::BlankNode(b) => Subject::BlankNode(b.clone()),
-        Subject::Triple(inner) => {
-            let (projected_inner, inner_mod) =
-                project_single_triple(inner, profile, policy, depth + 1)?;
-            modified |= inner_mod;
-            Subject::Triple(Box::new(projected_inner))
-        }
+        NamedOrBlankNode::BlankNode(b) => NamedOrBlankNode::BlankNode(b.clone()),
     };
 
     let clean_object = match &triple.object {
@@ -210,12 +204,6 @@ fn project_single_triple(
             } else {
                 Term::Literal(lit.clone())
             }
-        }
-        Term::Triple(inner) => {
-            let (projected_inner, inner_mod) =
-                project_single_triple(inner, profile, policy, depth + 1)?;
-            modified |= inner_mod;
-            Term::Triple(Box::new(projected_inner))
         }
     };
 
@@ -364,12 +352,12 @@ fn scrub_secrets(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
     while !rest.is_empty() {
-        if let Some(after_open) = rest.strip_prefix("«redacted:") {
-            if let Some(end_idx) = after_open.find('»') {
-                out.push_str("[REDACTED_SECRET]");
-                rest = &after_open[end_idx + '»'.len_utf8()..];
-                continue;
-            }
+        if let Some(after_open) = rest.strip_prefix("«redacted:")
+            && let Some(end_idx) = after_open.find('»')
+        {
+            out.push_str("[REDACTED_SECRET]");
+            rest = &after_open[end_idx + '»'.len_utf8()..];
+            continue;
         }
 
         let matched_prefix = ["sk-", "ghp_", "gho_", "github_pat_"]
@@ -610,7 +598,7 @@ mod tests {
         };
         let profile = DisclosureProfile::resolve(&agent, &policy);
 
-        let subj = Subject::NamedNode(
+        let subj = NamedOrBlankNode::NamedNode(
             wolin_storage::rdf_model::NamedNode::new("https://corp.example/u/1").unwrap(),
         );
         let t_badge = Triple::new(
@@ -620,27 +608,13 @@ mod tests {
             Term::Literal(Literal::new_simple_literal("EMP-991")),
         );
         let t_pin = Triple::new(
-            subj.clone(),
+            subj,
             wolin_storage::rdf_model::NamedNode::new("https://corp.example/ns#vaultPin").unwrap(),
             Term::Literal(Literal::new_simple_literal("0000")),
         );
-        let quoted_subj = Triple::new(
-            Subject::Triple(Box::new(t_pin.clone())),
-            wolin_storage::rdf_model::NamedNode::new("https://corp.example/ns#source").unwrap(),
-            Term::Literal(Literal::new_simple_literal("audit")),
-        );
-        let quoted_obj = Triple::new(
-            subj,
-            wolin_storage::rdf_model::NamedNode::new("https://corp.example/ns#asserts").unwrap(),
-            Term::Triple(Box::new(t_badge.clone())),
-        );
 
-        let projected = project_triples(
-            &[t_badge, t_pin, quoted_subj, quoted_obj],
-            &profile,
-            &policy,
-        );
+        let projected = project_triples(&[t_badge, t_pin], &profile, &policy);
         assert!(projected.triples.is_empty());
-        assert_eq!(projected.redacted_triples, 4);
+        assert_eq!(projected.redacted_triples, 2);
     }
 }

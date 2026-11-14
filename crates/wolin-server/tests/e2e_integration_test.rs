@@ -1,14 +1,14 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
-    body::{to_bytes, Body},
-    http::{header, Method, Request, StatusCode},
     Router,
+    body::{Body, to_bytes},
+    http::{Method, Request, StatusCode, header},
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::oneshot;
 use tower::ServiceExt;
@@ -17,9 +17,8 @@ use wolin_identity::{JwtSignatureVerifier, OidcValidationOptions};
 use wolin_mcp::protocol::ACCESS_DENIED_ERROR;
 use wolin_policy::{AccessMode, AcpPolicy, DelegationGrant, PolicyEngine, SubjectMatcher, WacRule};
 use wolin_server::{
-    build_router,
+    AppState, LdpConfig, build_router,
     ldp::{LDP_BASIC_CONTAINER, LDP_RDF_SOURCE},
-    AppState, LdpConfig,
 };
 
 const BASE_URL: &str = "http://pod.wolin.local";
@@ -351,13 +350,15 @@ async fn e2e_full_sovereign_pod_ldp_to_mcp_zero_pii_and_pdp_lifecycle() {
         .await
         .unwrap();
     assert_eq!(put_profile.status(), StatusCode::CREATED);
-    assert!(put_profile
-        .headers()
-        .get(header::LINK)
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .contains(&format!("<{LDP_RDF_SOURCE}>; rel=\"type\"")));
+    assert!(
+        put_profile
+            .headers()
+            .get(header::LINK)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains(&format!("<{LDP_RDF_SOURCE}>; rel=\"type\""))
+    );
 
     // Also store a confidential tax document inside ACP-denied `/pods/alice/private/`
     let put_private = app
@@ -454,10 +455,12 @@ async fn e2e_full_sovereign_pod_ldp_to_mcp_zero_pii_and_pdp_lifecycle() {
     )
     .await;
     assert_eq!(pre_grant_resp["result"]["isError"], true);
-    assert!(pre_grant_resp["result"]["content"][0]["text"]
-        .as_str()
-        .unwrap()
-        .contains("delegation"));
+    assert!(
+        pre_grant_resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("delegation")
+    );
 
     // Register attenuated Read-only DelegationGrant on `/pods/alice/` for ResearchCopilot
     state.with_policy_mut(|engine| {
@@ -603,10 +606,12 @@ async fn e2e_full_sovereign_pod_ldp_to_mcp_zero_pii_and_pdp_lifecycle() {
     )
     .await;
     assert_eq!(denied_private_resp["result"]["isError"], true);
-    assert!(denied_private_resp["result"]["content"][0]["text"]
-        .as_str()
-        .unwrap()
-        .contains("ACP policy"));
+    assert!(
+        denied_private_resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("ACP policy")
+    );
 
     // Selective Disclosure (`pii:email` scope): unlocks `schema:email`, keeps phone/SSN/secret redacted
     let mailer_jwt =
@@ -703,10 +708,12 @@ async fn e2e_full_sovereign_pod_ldp_to_mcp_zero_pii_and_pdp_lifecycle() {
             wr_resp["result"]["isError"], true,
             "expected MCP write denial for caller index {idx}"
         );
-        assert!(wr_resp["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("Access denied"));
+        assert!(
+            wr_resp["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("Access denied")
+        );
     }
 
     // 4b. Solid LDP HTTP PUT / PATCH / DELETE rejected for Read-only ResearchCopilot & ungranted Mallory (403) and Anonymous (401)
@@ -990,10 +997,12 @@ async fn e2e_bidirectional_ldp_mcp_catalog_acl_sync_and_protocol_guards() {
         }),
     )
     .await;
-    assert!(bob_allowed["result"]["contents"][0]["text"]
-        .as_str()
-        .unwrap()
-        .contains("Synthesized via MCP"));
+    assert!(
+        bob_allowed["result"]["contents"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Synthesized via MCP")
+    );
 
     // Alice DELETEs `/pods/alice/workspace/.acl` -> Bob's MCP access is immediately revoked!
     let del_acl = app

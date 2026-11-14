@@ -6,7 +6,7 @@ use wolin_core::{ResourceUri, WebId};
 use wolin_identity::OidcValidationOptions;
 use wolin_policy::{AccessMode, PolicyEngine, SubjectMatcher, WacRule};
 use wolin_server::{
-    build_router, shutdown_signal, AppState, CliParseOutcome, LdpConfig, ServerCliConfig,
+    AppState, CliParseOutcome, LdpConfig, ServerCliConfig, build_router, shutdown_signal,
 };
 
 #[tokio::main]

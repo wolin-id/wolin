@@ -271,10 +271,10 @@ impl OidcValidator {
         }
 
         // Fast path: local configured OIDC issuer with same-org WebID or DID principal.
-        if claims.iss == options.expected_issuer.trim() {
-            if let Ok(local_principal) = Self::validate_parsed_claims(&claims, options) {
-                return Ok(local_principal);
-            }
+        if claims.iss == options.expected_issuer.trim()
+            && let Ok(local_principal) = Self::validate_parsed_claims(&claims, options)
+        {
+            return Ok(local_principal);
         }
 
         // Federated Solid-OIDC path: validate core claims + dereference WebID RDF Profile.
@@ -291,12 +291,12 @@ impl OidcValidator {
             ));
         }
 
-        if let Some(ref act) = claims.act {
-            if act.act.is_some() {
-                return Err(WolinError::Unauthenticated(
-                    "Nested multi-hop RFC 8693 'act' chains are rejected".to_string(),
-                ));
-            }
+        if let Some(ref act) = claims.act
+            && act.act.is_some()
+        {
+            return Err(WolinError::Unauthenticated(
+                "Nested multi-hop RFC 8693 'act' chains are rejected".to_string(),
+            ));
         }
 
         let raw_webid = if let Some(ref delegator) = claims.delegated_by {
@@ -383,12 +383,12 @@ impl OidcValidator {
                 "OIDC audience (aud) claim must be non-empty".to_string(),
             ));
         }
-        if let Some(ref expected_aud) = options.expected_audience {
-            if !claims.aud.iter().any(|a| a == expected_aud) {
-                return Err(WolinError::Unauthenticated(format!(
-                    "OIDC audience mismatch: expected '{expected_aud}'"
-                )));
-            }
+        if let Some(ref expected_aud) = options.expected_audience
+            && !claims.aud.iter().any(|a| a == expected_aud)
+        {
+            return Err(WolinError::Unauthenticated(format!(
+                "OIDC audience mismatch: expected '{expected_aud}'"
+            )));
         }
 
         let now = match options.now_epoch_secs {
@@ -403,12 +403,12 @@ impl OidcValidator {
             ));
         }
 
-        if let Some(nbf) = claims.nbf {
-            if now.saturating_add(leeway) < nbf {
-                return Err(WolinError::Unauthenticated(
-                    "OIDC token is not yet valid (nbf)".to_string(),
-                ));
-            }
+        if let Some(nbf) = claims.nbf
+            && now.saturating_add(leeway) < nbf
+        {
+            return Err(WolinError::Unauthenticated(
+                "OIDC token is not yet valid (nbf)".to_string(),
+            ));
         }
 
         if let Some(iat) = claims.iat {
@@ -522,7 +522,7 @@ fn normalize_raw_claims(raw: RawOidcClaims) -> Result<OidcClaims> {
         None => {
             return Err(WolinError::Unauthenticated(
                 "Missing required OIDC 'aud' claim".to_string(),
-            ))
+            ));
         }
     };
 
@@ -593,12 +593,12 @@ fn canonicalize_did_if_did(id: &str) -> Result<String> {
 }
 
 fn map_claims_to_principal(claims: &OidcClaims) -> Result<Principal> {
-    if let Some(ref act) = claims.act {
-        if act.act.is_some() {
-            return Err(WolinError::Unauthenticated(
-                "Nested multi-hop RFC 8693 'act' chains are rejected".to_string(),
-            ));
-        }
+    if let Some(ref act) = claims.act
+        && act.act.is_some()
+    {
+        return Err(WolinError::Unauthenticated(
+            "Nested multi-hop RFC 8693 'act' chains are rejected".to_string(),
+        ));
     }
 
     let canonical_sub = canonicalize_did_if_did(claims.sub.trim())?;
@@ -904,12 +904,12 @@ fn validate_solid_oidc_temporal_and_aud_claims(
             "OIDC token has expired".to_string(),
         ));
     }
-    if let Some(nbf) = claims.nbf {
-        if now.saturating_add(leeway) < nbf {
-            return Err(WolinError::Unauthenticated(
-                "OIDC token is not yet valid (nbf)".to_string(),
-            ));
-        }
+    if let Some(nbf) = claims.nbf
+        && now.saturating_add(leeway) < nbf
+    {
+        return Err(WolinError::Unauthenticated(
+            "OIDC token is not yet valid (nbf)".to_string(),
+        ));
     }
     if let Some(iat) = claims.iat {
         if claims.exp <= iat {
@@ -1096,19 +1096,23 @@ mod tests {
             "https://evil.idp.example",
             "https://evil.idp.example:443@trusted-idp.corp/profile#admin", // gitleaks:allow
         );
-        assert!(OidcValidator::validate_parsed_claims(
-            &c1,
-            &OidcValidationOptions::new("https://evil.idp.example").with_now(2_000_000_100)
-        )
-        .is_err());
+        assert!(
+            OidcValidator::validate_parsed_claims(
+                &c1,
+                &OidcValidationOptions::new("https://evil.idp.example").with_now(2_000_000_100)
+            )
+            .is_err()
+        );
 
         // 2. Multi-part ccTLD (.co.kr) cross-org collision
         let c2 = make_claim("https://evil.co.kr", "https://samsung.co.kr/profile#ceo");
-        assert!(OidcValidator::validate_parsed_claims(
-            &c2,
-            &OidcValidationOptions::new("https://evil.co.kr").with_now(2_000_000_100)
-        )
-        .is_err());
+        assert!(
+            OidcValidator::validate_parsed_claims(
+                &c2,
+                &OidcValidationOptions::new("https://evil.co.kr").with_now(2_000_000_100)
+            )
+            .is_err()
+        );
 
         // 3. Multi-tenant IdP cloud (.zitadel.cloud & regional .us1.zitadel.cloud) cross-tenant collision
         for (iss, victim) in [
@@ -1126,11 +1130,13 @@ mod tests {
             ),
         ] {
             let c3 = make_claim(iss, victim);
-            assert!(OidcValidator::validate_parsed_claims(
-                &c3,
-                &OidcValidationOptions::new(iss).with_now(2_000_000_100)
-            )
-            .is_err());
+            assert!(
+                OidcValidator::validate_parsed_claims(
+                    &c3,
+                    &OidcValidationOptions::new(iss).with_now(2_000_000_100)
+                )
+                .is_err()
+            );
         }
 
         // Exact same tenant host on ZITADEL Cloud IS allowed
@@ -1138,33 +1144,40 @@ mod tests {
             "https://acme.us1.zitadel.cloud",
             "https://acme.us1.zitadel.cloud/users/alice",
         );
-        assert!(OidcValidator::validate_parsed_claims(
-            &same_tenant,
-            &OidcValidationOptions::new("https://acme.us1.zitadel.cloud").with_now(2_000_000_100)
-        )
-        .is_ok());
+        assert!(
+            OidcValidator::validate_parsed_claims(
+                &same_tenant,
+                &OidcValidationOptions::new("https://acme.us1.zitadel.cloud")
+                    .with_now(2_000_000_100)
+            )
+            .is_ok()
+        );
 
         // 4. Unbound did:key asserted in `webid` when `sub != did:key:...`
         let c4 = make_claim(
             "https://evil.idp.example",
             "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK", // gitleaks:allow
         );
-        assert!(OidcValidator::validate_parsed_claims(
-            &c4,
-            &OidcValidationOptions::new("https://evil.idp.example").with_now(2_000_000_100)
-        )
-        .is_err());
+        assert!(
+            OidcValidator::validate_parsed_claims(
+                &c4,
+                &OidcValidationOptions::new("https://evil.idp.example").with_now(2_000_000_100)
+            )
+            .is_err()
+        );
 
         // 5. Same 3-label org under .co.kr IS allowed
         let valid_kr = make_claim(
             "https://sso.samsung.co.kr",
             "https://pod.samsung.co.kr/alice#me",
         );
-        assert!(OidcValidator::validate_parsed_claims(
-            &valid_kr,
-            &OidcValidationOptions::new("https://sso.samsung.co.kr").with_now(2_000_000_100)
-        )
-        .is_ok());
+        assert!(
+            OidcValidator::validate_parsed_claims(
+                &valid_kr,
+                &OidcValidationOptions::new("https://sso.samsung.co.kr").with_now(2_000_000_100)
+            )
+            .is_ok()
+        );
     }
 
     fn b64url_encode_test(bytes: &[u8]) -> String {

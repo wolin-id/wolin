@@ -383,10 +383,12 @@ fn oxigraph_sparql_construct_zero_pii_projection_and_named_graphs() {
     let projected = graph.query_construct(construct_sparql).unwrap();
     // 1 rdf:type + 1 displayName + 2 interest triples = 4 projected triples
     assert_eq!(projected.len(), 4);
-    assert!(projected
-        .triples
-        .iter()
-        .all(|t| !t.predicate.contains("secretApiKey") && !t.predicate.contains("mbox")));
+    assert!(
+        projected
+            .triples
+            .iter()
+            .all(|t| !t.predicate.contains("secretApiKey") && !t.predicate.contains("mbox"))
+    );
 
     // Round-trip projected subgraph through Turtle into an isolated agent view store
     let projected_ttl = projected.to_turtle().unwrap();

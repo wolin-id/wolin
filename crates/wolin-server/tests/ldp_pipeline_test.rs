@@ -1,12 +1,12 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
-    body::{to_bytes, Body},
-    http::{header, Method, Request, StatusCode},
     Router,
+    body::{Body, to_bytes},
+    http::{Method, Request, StatusCode, header},
 };
 use serde_json::json;
 use tower::ServiceExt;
@@ -14,9 +14,8 @@ use wolin_core::{ResourceUri, WebId};
 use wolin_identity::{JwtSignatureVerifier, OidcValidationOptions};
 use wolin_policy::{AccessMode, AcpPolicy, DelegationGrant, PolicyEngine, SubjectMatcher, WacRule};
 use wolin_server::{
-    build_router,
+    AppState, LdpConfig, build_router,
     ldp::{LDP_BASIC_CONTAINER, LDP_NON_RDF_SOURCE, LDP_RDF_SOURCE, LDP_RESOURCE},
-    AppState, LdpConfig,
 };
 use wolin_storage::{PhysicalStore, SemanticGraphStore};
 
@@ -632,10 +631,12 @@ async fn rdf_content_negotiation_and_etag_preconditions() {
         head_resp.headers().get(header::ETAG).unwrap(),
         etag_v1.as_str()
     );
-    assert!(to_bytes(head_resp.into_body(), 65_536)
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        to_bytes(head_resp.into_body(), 65_536)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 
     let not_mod = app
         .clone()

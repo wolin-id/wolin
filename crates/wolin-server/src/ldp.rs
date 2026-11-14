@@ -2,25 +2,26 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use axum::{
-    body::{to_bytes, Body},
+    body::{Body, to_bytes},
     extract::{Request, State},
-    http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri},
+    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, header},
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use wolin_core::{Principal, ResourceKind, ResourceUri, WebId};
 use wolin_policy::{AccessDecision, AccessMode, PolicyEngine, SubjectMatcher, WacRule};
+#[allow(deprecated)]
 use wolin_storage::{
-    rdf_io::{JsonLdProfileSet, RdfFormat},
-    rdf_model::{NamedNode, Subject, Term, Triple},
-    rdf_sparql::Update as SparqlUpdate,
     PhysicalStore, SemanticGraphStore,
+    rdf_io::{JsonLdProfileSet, RdfFormat},
+    rdf_model::{NamedNode, NamedOrBlankNode, Term, Triple},
+    rdf_sparql::Update as SparqlUpdate,
 };
 
 use crate::{
-    auth::extract_principal_for_request, error::LdpError, pods::extract_subdomain_pod, AppState,
-    LdpConfig,
+    AppState, LdpConfig, auth::extract_principal_for_request, error::LdpError,
+    pods::extract_subdomain_pod,
 };
 
 const CATALOG_META_KEY: &str = "__wolin_meta/catalog.json";
@@ -285,7 +286,7 @@ async fn handle_get_or_head(
             let rdf_type_node = NamedNode::new(RDF_TYPE).unwrap();
             for type_iri in [LDP_BASIC_CONTAINER, LDP_CONTAINER, LDP_RESOURCE] {
                 triples.push(Triple::new(
-                    Subject::NamedNode(container_node.clone()),
+                    NamedOrBlankNode::NamedNode(container_node.clone()),
                     rdf_type_node.clone(),
                     Term::NamedNode(NamedNode::new(type_iri).unwrap()),
                 ));
@@ -293,7 +294,7 @@ async fn handle_get_or_head(
             if entry.path == "/" || is_pod_root_path(&entry.path) {
                 let pim_storage_node = NamedNode::new(PIM_STORAGE).unwrap();
                 let storage_triple = Triple::new(
-                    Subject::NamedNode(container_node.clone()),
+                    NamedOrBlankNode::NamedNode(container_node.clone()),
                     rdf_type_node.clone(),
                     Term::NamedNode(pim_storage_node),
                 );
@@ -312,7 +313,7 @@ async fn handle_get_or_head(
                 let child_node = NamedNode::new(&child_iri)
                     .map_err(|e| LdpError::Internal(format!("Invalid child IRI: {e}")))?;
                 triples.push(Triple::new(
-                    Subject::NamedNode(container_node.clone()),
+                    NamedOrBlankNode::NamedNode(container_node.clone()),
                     contains_pred.clone(),
                     Term::NamedNode(child_node),
                 ));
@@ -489,12 +490,12 @@ async fn handle_put(
             ));
         }
         let triples = if body_bytes.is_empty() {
-            if let Some(ct) = raw_ct.as_deref() {
-                if parse_rdf_media_type(ct).is_none() {
-                    return Err(LdpError::UnsupportedMediaType(format!(
-                        "Unsupported Content-Type '{ct}' for LDP BasicContainer"
-                    )));
-                }
+            if let Some(ct) = raw_ct.as_deref()
+                && parse_rdf_media_type(ct).is_none()
+            {
+                return Err(LdpError::UnsupportedMediaType(format!(
+                    "Unsupported Content-Type '{ct}' for LDP BasicContainer"
+                )));
             }
             Vec::new()
         } else {
@@ -568,13 +569,13 @@ async fn handle_put(
             )
         }
         PreparedWrite::Rdf { triples } => {
-            if let Some(ref prev) = existing {
-                if prev.kind == ResourceKind::NonRdfSource {
-                    let _ = state
-                        .physical_store
-                        .delete(&blob_key_for_path(&target.canonical_path))
-                        .await;
-                }
+            if let Some(ref prev) = existing
+                && prev.kind == ResourceKind::NonRdfSource
+            {
+                let _ = state
+                    .physical_store
+                    .delete(&blob_key_for_path(&target.canonical_path))
+                    .await;
             }
             state
                 .graph_store
@@ -614,10 +615,10 @@ async fn handle_put(
             content_type,
             bytes,
         } => {
-            if let Some(ref prev) = existing {
-                if prev.kind == ResourceKind::RdfSource {
-                    let _ = state.graph_store.delete_named_graph(&resource_iri);
-                }
+            if let Some(ref prev) = existing
+                && prev.kind == ResourceKind::RdfSource
+            {
+                let _ = state.graph_store.delete_named_graph(&resource_iri);
             }
             let etag = compute_etag(&bytes);
             let blob_key = blob_key_for_path(&target.canonical_path);
@@ -648,10 +649,10 @@ async fn handle_put(
         StatusCode::CREATED
     };
     let mut resp = status.into_response();
-    if status == StatusCode::CREATED {
-        if let Ok(loc) = HeaderValue::from_str(&parse_base_iri) {
-            resp.headers_mut().insert(header::LOCATION, loc);
-        }
+    if status == StatusCode::CREATED
+        && let Ok(loc) = HeaderValue::from_str(&parse_base_iri)
+    {
+        resp.headers_mut().insert(header::LOCATION, loc);
     }
     attach_ldp_headers(
         resp.headers_mut(),
@@ -751,12 +752,12 @@ async fn handle_post(
 
     let (child_kind, stored_ct, new_etag) = if requested_container {
         let triples = if body_bytes.is_empty() {
-            if let Some(ct) = raw_ct.as_deref() {
-                if parse_rdf_media_type(ct).is_none() {
-                    return Err(LdpError::UnsupportedMediaType(format!(
-                        "Unsupported Content-Type '{ct}' for LDP BasicContainer"
-                    )));
-                }
+            if let Some(ct) = raw_ct.as_deref()
+                && parse_rdf_media_type(ct).is_none()
+            {
+                return Err(LdpError::UnsupportedMediaType(format!(
+                    "Unsupported Content-Type '{ct}' for LDP BasicContainer"
+                )));
             }
             Vec::new()
         } else {
@@ -914,6 +915,7 @@ async fn handle_patch(
 
     let resource_iri = http_iri(&state.config.base_url, &target.canonical_path);
     let ext_resource_iri = target.external_iri(&state.config.base_url, &target.canonical_path);
+    #[allow(deprecated)]
     let parsed_update = SparqlUpdate::parse(sparql_text, Some(&ext_resource_iri))
         .map_err(|e| LdpError::BadRequest(format!("Invalid SPARQL-Update syntax: {e}")))?;
 
@@ -1054,10 +1056,10 @@ async fn handle_patch(
         StatusCode::CREATED
     };
     let mut resp = status.into_response();
-    if status == StatusCode::CREATED {
-        if let Ok(loc) = HeaderValue::from_str(&ext_resource_iri) {
-            resp.headers_mut().insert(header::LOCATION, loc);
-        }
+    if status == StatusCode::CREATED
+        && let Ok(loc) = HeaderValue::from_str(&ext_resource_iri)
+    {
+        resp.headers_mut().insert(header::LOCATION, loc);
     }
     attach_ldp_headers(
         resp.headers_mut(),
@@ -1205,13 +1207,13 @@ fn ensure_no_explicit_acp_deny(
         evaluate_decision(&engine, state, principal, child_target, mode)
     };
 
-    if let AccessDecision::Deny { reason } = decision {
-        if reason.contains("ACP policy") {
-            return match principal {
-                Principal::Anonymous => Err(LdpError::Unauthenticated(reason)),
-                _ => Err(LdpError::Forbidden(reason)),
-            };
-        }
+    if let AccessDecision::Deny { reason } = decision
+        && reason.contains("ACP policy")
+    {
+        return match principal {
+            Principal::Anonymous => Err(LdpError::Unauthenticated(reason)),
+            _ => Err(LdpError::Forbidden(reason)),
+        };
     }
     Ok(())
 }
@@ -1343,10 +1345,10 @@ fn attach_ldp_headers(
         headers.insert(HeaderName::from_static("wac-allow"), val);
     }
 
-    if let Some(tag) = etag {
-        if let Ok(val) = HeaderValue::from_str(tag) {
-            headers.insert(header::ETAG, val);
-        }
+    if let Some(tag) = etag
+        && let Ok(val) = HeaderValue::from_str(tag)
+    {
+        headers.insert(header::ETAG, val);
     }
 
     Ok(())
@@ -1612,17 +1614,14 @@ fn rebase_triples(triples: Vec<Triple>, from_prefix: &str, to_prefix: &str) -> V
 
 fn rebase_single_triple(t: Triple, from_prefix: &str, to_prefix: &str) -> Triple {
     let subject = match t.subject {
-        Subject::NamedNode(n) => match rebase_iri_str(n.as_str(), from_prefix, to_prefix) {
-            Some(new_iri) => NamedNode::new(new_iri)
-                .map(Subject::NamedNode)
-                .unwrap_or(Subject::NamedNode(n)),
-            None => Subject::NamedNode(n),
-        },
-        Subject::Triple(inner) => Subject::Triple(Box::new(rebase_single_triple(
-            *inner,
-            from_prefix,
-            to_prefix,
-        ))),
+        NamedOrBlankNode::NamedNode(n) => {
+            match rebase_iri_str(n.as_str(), from_prefix, to_prefix) {
+                Some(new_iri) => NamedNode::new(new_iri)
+                    .map(NamedOrBlankNode::NamedNode)
+                    .unwrap_or(NamedOrBlankNode::NamedNode(n)),
+                None => NamedOrBlankNode::NamedNode(n),
+            }
+        }
         other => other,
     };
     let predicate = match rebase_iri_str(t.predicate.as_str(), from_prefix, to_prefix) {
@@ -1636,11 +1635,6 @@ fn rebase_single_triple(t: Triple, from_prefix: &str, to_prefix: &str) -> Triple
                 .unwrap_or(Term::NamedNode(n)),
             None => Term::NamedNode(n),
         },
-        Term::Triple(inner) => Term::Triple(Box::new(rebase_single_triple(
-            *inner,
-            from_prefix,
-            to_prefix,
-        ))),
         other => other,
     };
     Triple::new(subject, predicate, object)
@@ -1861,12 +1855,12 @@ fn negotiate_rdf_format(headers: &HeaderMap) -> Result<RdfFormat, LdpError> {
             }
         }
 
-        if let Some((spec, q)) = matched_rule {
-            if q > 0 {
-                let candidate_rank = (q, spec);
-                if best.is_none_or(|(best_q, best_spec, _)| candidate_rank > (best_q, best_spec)) {
-                    best = Some((q, spec, fmt));
-                }
+        if let Some((spec, q)) = matched_rule
+            && q > 0
+        {
+            let candidate_rank = (q, spec);
+            if best.is_none_or(|(best_q, best_spec, _)| candidate_rank > (best_q, best_spec)) {
+                best = Some((q, spec, fmt));
             }
         }
     }
@@ -1954,21 +1948,18 @@ fn parse_accept_range(raw: &str) -> Result<AcceptRange, LdpError> {
 
     let mut q_millis = 1000u32;
     for param in segments {
-        if let Some((k, v)) = param.split_once('=') {
-            if k.trim().eq_ignore_ascii_case("q") {
-                let q_val: f32 = v.trim().parse().map_err(|_| {
-                    LdpError::BadRequest(format!(
-                        "Invalid quality weight 'q={}' in Accept",
-                        v.trim()
-                    ))
-                })?;
-                if !(0.0..=1.0).contains(&q_val) {
-                    return Err(LdpError::BadRequest(
-                        "Accept quality weight q must be between 0.0 and 1.0".to_string(),
-                    ));
-                }
-                q_millis = (q_val * 1000.0).round() as u32;
+        if let Some((k, v)) = param.split_once('=')
+            && k.trim().eq_ignore_ascii_case("q")
+        {
+            let q_val: f32 = v.trim().parse().map_err(|_| {
+                LdpError::BadRequest(format!("Invalid quality weight 'q={}' in Accept", v.trim()))
+            })?;
+            if !(0.0..=1.0).contains(&q_val) {
+                return Err(LdpError::BadRequest(
+                    "Accept quality weight q must be between 0.0 and 1.0".to_string(),
+                ));
             }
+            q_millis = (q_val * 1000.0).round() as u32;
         }
     }
 
@@ -1995,13 +1986,13 @@ fn parse_link_type_iris(headers: &HeaderMap) -> Result<BTreeSet<String>, LdpErro
                 continue;
             };
             let is_rel_type = parts.any(|param| {
-                if let Some((k, v)) = param.split_once('=') {
-                    if k.trim().eq_ignore_ascii_case("rel") {
-                        let unquoted = v.trim().trim_matches('"');
-                        return unquoted
-                            .split_whitespace()
-                            .any(|tok| tok.eq_ignore_ascii_case("type"));
-                    }
+                if let Some((k, v)) = param.split_once('=')
+                    && k.trim().eq_ignore_ascii_case("rel")
+                {
+                    let unquoted = v.trim().trim_matches('"');
+                    return unquoted
+                        .split_whitespace()
+                        .any(|tok| tok.eq_ignore_ascii_case("type"));
                 }
                 false
             });
@@ -2081,6 +2072,7 @@ struct SparqlPatchProfile {
     requires_read: bool,
 }
 
+#[allow(deprecated)]
 fn classify_sparql_update(update: &SparqlUpdate) -> Result<SparqlPatchProfile, LdpError> {
     let canonical = update.to_string();
     let mut op_count = 0usize;
@@ -2252,12 +2244,12 @@ fn check_write_preconditions(
             .to_str()
             .map_err(|_| LdpError::BadRequest("Malformed If-None-Match header".to_string()))?
             .trim();
-        if let Some(etag) = current_etag {
-            if s == "*" || s.split(',').any(|tok| tok.trim() == etag) {
-                return Err(LdpError::PreconditionFailed(
-                    "If-None-Match precondition failed: target resource already exists".to_string(),
-                ));
-            }
+        if let Some(etag) = current_etag
+            && (s == "*" || s.split(',').any(|tok| tok.trim() == etag))
+        {
+            return Err(LdpError::PreconditionFailed(
+                "If-None-Match precondition failed: target resource already exists".to_string(),
+            ));
         }
     }
 
@@ -2345,9 +2337,8 @@ pub(crate) fn extract_wac_rules_from_acl_triples(
     let mut grouped: BTreeMap<String, Vec<&Triple>> = BTreeMap::new();
     for t in triples {
         let key = match &t.subject {
-            Subject::NamedNode(n) => format!("I:{}", n.as_str()),
-            Subject::BlankNode(b) => format!("B:{}", b.as_str()),
-            Subject::Triple(_) => continue,
+            NamedOrBlankNode::NamedNode(n) => format!("I:{}", n.as_str()),
+            NamedOrBlankNode::BlankNode(b) => format!("B:{}", b.as_str()),
         };
         grouped.entry(key).or_default().push(t);
     }
@@ -2492,17 +2483,17 @@ fn map_acl_target_iri_to_policy_uri(
     if raw_iri == pod_prefix || raw_iri == format!("{pod_prefix}/") {
         return Ok(ResourceUri(pod_prefix.to_string()));
     }
-    if let Some(rel_path) = raw_iri.strip_prefix(pod_prefix) {
-        if rel_path.starts_with('/') {
-            let parsed = parse_ldp_path_str(rel_path, pod_prefix)?;
-            if parsed.is_acl {
-                return Err(LdpError::BadRequest(
-                    "acl:accessTo / acl:default must reference the governed resource, not .acl itself"
-                        .to_string(),
-                ));
-            }
-            return Ok(parsed.policy_target);
+    if let Some(rel_path) = raw_iri.strip_prefix(pod_prefix)
+        && rel_path.starts_with('/')
+    {
+        let parsed = parse_ldp_path_str(rel_path, pod_prefix)?;
+        if parsed.is_acl {
+            return Err(LdpError::BadRequest(
+                "acl:accessTo / acl:default must reference the governed resource, not .acl itself"
+                    .to_string(),
+            ));
         }
+        return Ok(parsed.policy_target);
     }
 
     Err(LdpError::Forbidden(format!(

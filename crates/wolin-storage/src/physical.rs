@@ -1,6 +1,6 @@
 use opendal::{
-    services::{Fs, Memory},
     ErrorKind, Operator,
+    services::{Fs, Memory},
 };
 use serde::{Deserialize, Serialize};
 use wolin_core::{Result, WolinError};
@@ -25,8 +25,7 @@ impl PhysicalStore {
     pub fn new_fs(root: &str) -> Result<Self> {
         let builder = Fs::default().root(root);
         let op = Operator::new(builder)
-            .map_err(|e| WolinError::Storage(format!("OpenDAL fs init failed: {e}")))?
-            .finish();
+            .map_err(|e| WolinError::Storage(format!("OpenDAL fs init failed: {e}")))?;
         Ok(Self { operator: op })
     }
 
@@ -34,8 +33,7 @@ impl PhysicalStore {
     pub fn new_memory() -> Result<Self> {
         let builder = Memory::default();
         let op = Operator::new(builder)
-            .map_err(|e| WolinError::Storage(format!("OpenDAL memory init failed: {e}")))?
-            .finish();
+            .map_err(|e| WolinError::Storage(format!("OpenDAL memory init failed: {e}")))?;
         Ok(Self { operator: op })
     }
 
@@ -55,6 +53,7 @@ impl PhysicalStore {
         self.operator
             .write(clean_key, data.into())
             .await
+            .map(|_| ())
             .map_err(|e| map_opendal_error("put", clean_key, e))
     }
 
@@ -70,6 +69,7 @@ impl PhysicalStore {
             .write_with(clean_key, data.into())
             .content_type(content_type)
             .await
+            .map(|_| ())
             .map_err(|e| map_opendal_error("put", clean_key, e))
     }
 

@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use wolin_core::{Principal, ResourceUri, WebId};
 use wolin_identity::{DidResolver, OidcValidationOptions, OidcValidator};
 use wolin_mcp::protocol::{
-    JsonRpcRequest, McpContentItem, McpToolCall, ACCESS_DENIED_ERROR, INVALID_PARAMS,
-    INVALID_REQUEST, METHOD_NOT_FOUND, PARSE_ERROR, RESOURCE_NOT_FOUND_ERROR,
+    ACCESS_DENIED_ERROR, INVALID_PARAMS, INVALID_REQUEST, JsonRpcRequest, METHOD_NOT_FOUND,
+    McpContentItem, McpToolCall, PARSE_ERROR, RESOURCE_NOT_FOUND_ERROR,
 };
 use wolin_mcp::{DisclosurePolicy, McpAgentServer, McpGatewayConfig, PiiCategory};
 use wolin_policy::{AccessMode, AcpPolicy, DelegationGrant, PolicyEngine, SubjectMatcher, WacRule};
@@ -313,10 +313,11 @@ async fn mcp_jsonrpc_handshake_discovery_notifications_and_batch_protocol() {
         { "jsonrpc": "2.0", "method": "notifications/initialized" },
         { "jsonrpc": "2.0", "method": "notifications/cancelled", "params": { "requestId": 1 } }
     ]);
-    assert!(gw
-        .handle_jsonrpc_str(&alice, &notif_batch.to_string())
-        .await
-        .is_none());
+    assert!(
+        gw.handle_jsonrpc_str(&alice, &notif_batch.to_string())
+            .await
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -437,10 +438,12 @@ async fn mcp_tools_crud_rdf_binary_list_and_etag_preconditions() {
             .await,
         );
         assert_eq!(read_res["content_type"], expected_mime);
-        assert!(read_res["data"]
-            .as_str()
-            .unwrap()
-            .contains("Wolin MCP Semantic Gateway"));
+        assert!(
+            read_res["data"]
+                .as_str()
+                .unwrap()
+                .contains("Wolin MCP Semantic Gateway")
+        );
     }
 
     // 5. Read binary resource via both `wolin_read_resource` tool and MCP `resources/read` + `resources/list`
@@ -472,9 +475,12 @@ async fn mcp_tools_crud_rdf_binary_list_and_etag_preconditions() {
     assert!(mcp_resources.iter().any(
         |r| r["uri"] == "wolin://pod/alice/notes/roadmap.ttl" && r["mimeType"] == "text/turtle"
     ));
-    assert!(mcp_resources
-        .iter()
-        .any(|r| r["uri"] == "wolin://pod/alice/assets/badge.png" && r["mimeType"] == "image/png"));
+    assert!(
+        mcp_resources
+            .iter()
+            .any(|r| r["uri"] == "wolin://pod/alice/assets/badge.png"
+                && r["mimeType"] == "image/png")
+    );
 
     let res_read_rpc = json!({
         "jsonrpc": "2.0",
@@ -943,10 +949,12 @@ async fn pdp_agent_delegation_lifecycle_acp_deny_and_cross_tenant_isolation() {
         )
         .await,
     );
-    assert!(spec_read["data"]
-        .as_str()
-        .unwrap()
-        .contains("Public Architecture Spec"));
+    assert!(
+        spec_read["data"]
+            .as_str()
+            .unwrap()
+            .contains("Public Architecture Spec")
+    );
 
     // Write is STILL denied because grant only allows `AccessMode::Read` (even though JWT had `write` scope!)
     let write_attempt = gw

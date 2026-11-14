@@ -3,12 +3,12 @@ use std::sync::Arc;
 use axum::{
     body::to_bytes,
     extract::{Request, State},
-    http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use wolin_mcp::protocol::{JsonRpcId, JsonRpcResponse, PARSE_ERROR};
 
-use crate::{auth::extract_principal_for_request, error::LdpError, AppState};
+use crate::{AppState, auth::extract_principal_for_request, error::LdpError};
 
 /// Handle Native MCP JSON-RPC 2.0 requests (`POST /mcp`) over Streamable HTTP.
 ///
@@ -146,18 +146,18 @@ fn validate_sse_accept(headers: &HeaderMap) -> Result<(), LdpError> {
             }
             let mut q_nonzero = true;
             for param in parts {
-                if let Some((k, v)) = param.split_once('=') {
-                    if k.trim().eq_ignore_ascii_case("q") {
-                        let q: f32 = v.trim().parse().map_err(|_| {
-                            LdpError::BadRequest("Invalid q weight in Accept header".to_string())
-                        })?;
-                        if !(0.0..=1.0).contains(&q) {
-                            return Err(LdpError::BadRequest(
-                                "Accept q weight must be between 0.0 and 1.0".to_string(),
-                            ));
-                        }
-                        q_nonzero = q > 0.0;
+                if let Some((k, v)) = param.split_once('=')
+                    && k.trim().eq_ignore_ascii_case("q")
+                {
+                    let q: f32 = v.trim().parse().map_err(|_| {
+                        LdpError::BadRequest("Invalid q weight in Accept header".to_string())
+                    })?;
+                    if !(0.0..=1.0).contains(&q) {
+                        return Err(LdpError::BadRequest(
+                            "Accept q weight must be between 0.0 and 1.0".to_string(),
+                        ));
                     }
+                    q_nonzero = q > 0.0;
                 }
             }
             if q_nonzero && matches!(media.as_str(), "text/event-stream" | "text/*" | "*/*") {

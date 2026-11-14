@@ -3,9 +3,10 @@ use std::path::Path;
 
 use oxigraph::io::{RdfFormat, RdfParser, RdfSerializer};
 use oxigraph::model::{
-    BlankNode, GraphNameRef, Literal, NamedNode, NamedNodeRef, Quad, QuadRef, Subject, Term, Triple,
+    BlankNode, GraphNameRef, Literal, NamedNode, NamedNodeRef, NamedOrBlankNode, Quad, QuadRef,
+    Term, Triple,
 };
-use oxigraph::sparql::QueryResults;
+use oxigraph::sparql::{QueryResults, SparqlEvaluator};
 use oxigraph::store::Store;
 use serde::{Deserialize, Serialize};
 use wolin_core::{Result, WolinError};
@@ -87,9 +88,6 @@ impl From<&Term> for RdfTerm {
                 datatype: lit.datatype().as_str().to_string(),
                 language: lit.language().map(str::to_string),
             },
-            Term::Triple(triple) => Self::QuotedTriple {
-                triple: Box::new(RdfTriple::from(triple.as_ref())),
-            },
         }
     }
 }
@@ -100,24 +98,21 @@ impl From<Term> for RdfTerm {
     }
 }
 
-impl From<&Subject> for RdfTerm {
-    fn from(subject: &Subject) -> Self {
+impl From<&NamedOrBlankNode> for RdfTerm {
+    fn from(subject: &NamedOrBlankNode) -> Self {
         match subject {
-            Subject::NamedNode(node) => Self::Iri {
+            NamedOrBlankNode::NamedNode(node) => Self::Iri {
                 value: node.as_str().to_string(),
             },
-            Subject::BlankNode(bnode) => Self::BlankNode {
+            NamedOrBlankNode::BlankNode(bnode) => Self::BlankNode {
                 id: bnode.as_str().to_string(),
-            },
-            Subject::Triple(triple) => Self::QuotedTriple {
-                triple: Box::new(RdfTriple::from(triple.as_ref())),
             },
         }
     }
 }
 
-impl From<Subject> for RdfTerm {
-    fn from(subject: Subject) -> Self {
+impl From<NamedOrBlankNode> for RdfTerm {
+    fn from(subject: NamedOrBlankNode) -> Self {
         Self::from(&subject)
     }
 }
@@ -154,9 +149,9 @@ impl TryFrom<&RdfTerm> for Term {
                     )))
                 }
             }
-            RdfTerm::QuotedTriple { triple } => {
-                Ok(Term::Triple(Box::new(Triple::try_from(triple.as_ref())?)))
-            }
+            RdfTerm::QuotedTriple { .. } => Err(WolinError::InvalidFormat(
+                "RDF-star quoted triples are not supported in Oxigraph 0.5".to_string(),
+            )),
         }
     }
 }
@@ -191,17 +186,19 @@ impl TryFrom<&RdfTriple> for Triple {
     fn try_from(triple: &RdfTriple) -> Result<Self> {
         let subject = match &triple.subject {
             RdfTerm::Iri { value } => {
-                Subject::NamedNode(NamedNode::new(value.as_str()).map_err(|e| {
+                NamedOrBlankNode::NamedNode(NamedNode::new(value.as_str()).map_err(|e| {
                     WolinError::InvalidFormat(format!("Invalid subject IRI '{value}': {e}"))
                 })?)
             }
             RdfTerm::BlankNode { id } => {
-                Subject::BlankNode(BlankNode::new(id.as_str()).map_err(|e| {
+                NamedOrBlankNode::BlankNode(BlankNode::new(id.as_str()).map_err(|e| {
                     WolinError::InvalidFormat(format!("Invalid subject blank node '{id}': {e}"))
                 })?)
             }
-            RdfTerm::QuotedTriple { triple } => {
-                Subject::Triple(Box::new(Triple::try_from(triple.as_ref())?))
+            RdfTerm::QuotedTriple { .. } => {
+                return Err(WolinError::InvalidFormat(
+                    "RDF-star quoted triples are not supported in Oxigraph 0.5".to_string(),
+                ));
             }
             RdfTerm::Literal { .. } => {
                 return Err(WolinError::InvalidFormat(
@@ -379,9 +376,15 @@ impl SemanticGraphStore {
     ///
     /// Returns `true` if the quad was newly added, or `false` if it was already present.
     pub fn insert_quad<'a>(&self, quad: impl Into<QuadRef<'a>>) -> Result<bool> {
+        let q: QuadRef<'a> = quad.into();
+        let existed = self
+            .store
+            .contains(q)
+            .map_err(|e| WolinError::Semantic(format!("Oxigraph quad check failed: {e}")))?;
         self.store
-            .insert(quad)
-            .map_err(|e| WolinError::Semantic(format!("Oxigraph quad insert failed: {e}")))
+            .insert(q)
+            .map_err(|e| WolinError::Semantic(format!("Oxigraph quad insert failed: {e}")))?;
+        Ok(!existed)
     }
 
     /// Atomically insert a batch of Oxigraph [`Quad`]s into the store.
@@ -396,9 +399,15 @@ impl SemanticGraphStore {
 
     /// Remove a single Oxigraph [`Quad`] / [`QuadRef`] from the store.
     pub fn remove_quad<'a>(&self, quad: impl Into<QuadRef<'a>>) -> Result<bool> {
+        let q: QuadRef<'a> = quad.into();
+        let existed = self
+            .store
+            .contains(q)
+            .map_err(|e| WolinError::Semantic(format!("Oxigraph quad check failed: {e}")))?;
         self.store
-            .remove(quad)
-            .map_err(|e| WolinError::Semantic(format!("Oxigraph quad remove failed: {e}")))
+            .remove(q)
+            .map_err(|e| WolinError::Semantic(format!("Oxigraph quad remove failed: {e}")))?;
+        Ok(existed)
     }
 
     /// Execute a SPARQL 1.1 `UPDATE` statement (`INSERT DATA`, `DELETE/INSERT WHERE`, etc.).
@@ -443,9 +452,12 @@ impl SemanticGraphStore {
 
     /// Execute any SPARQL 1.1 query (`SELECT`, `CONSTRUCT`/`DESCRIBE`, `ASK`) and return structured output.
     pub fn execute_sparql(&self, sparql: &str) -> Result<SparqlQueryOutput> {
-        let results = self
-            .store
-            .query(sparql)
+        let prepared = SparqlEvaluator::new()
+            .parse_query(sparql)
+            .map_err(|e| WolinError::Semantic(format!("SPARQL parse failed: {e}")))?;
+        let results = prepared
+            .on_store(&self.store)
+            .execute()
             .map_err(|e| WolinError::Semantic(format!("SPARQL query failed: {e}")))?;
 
         match results {
@@ -544,15 +556,17 @@ impl SemanticGraphStore {
             .collect();
         let count = quads.len();
 
-        self.store
-            .transaction(|mut tx| {
-                tx.remove_named_graph(graph_node)?;
-                tx.extend(quads.iter())?;
-                std::result::Result::<(), oxigraph::store::StorageError>::Ok(())
-            })
-            .map_err(|e| {
-                WolinError::Semantic(format!("Oxigraph named graph replace failed: {e}"))
-            })?;
+        let mut tx = self
+            .store
+            .start_transaction()
+            .map_err(|e| WolinError::Semantic(format!("Oxigraph transaction start failed: {e}")))?;
+        tx.remove_named_graph(graph_node).map_err(|e| {
+            WolinError::Semantic(format!("Oxigraph named graph remove failed: {e}"))
+        })?;
+        tx.extend(quads.iter());
+        tx.commit().map_err(|e| {
+            WolinError::Semantic(format!("Oxigraph named graph replace commit failed: {e}"))
+        })?;
         Ok(count)
     }
 
@@ -580,9 +594,14 @@ impl SemanticGraphStore {
         let graph_node = NamedNodeRef::new(graph_iri).map_err(|e| {
             WolinError::InvalidFormat(format!("Invalid named graph IRI '{graph_iri}': {e}"))
         })?;
-        self.store
-            .remove_named_graph(graph_node)
-            .map_err(|e| WolinError::Semantic(format!("Oxigraph remove_named_graph failed: {e}")))
+        let existed = self
+            .store
+            .contains_named_graph(graph_node)
+            .map_err(|e| WolinError::Semantic(format!("Oxigraph named graph check failed: {e}")))?;
+        self.store.remove_named_graph(graph_node).map_err(|e| {
+            WolinError::Semantic(format!("Oxigraph remove_named_graph failed: {e}"))
+        })?;
+        Ok(existed)
     }
 
     fn ingest_with_parser(&self, parser: RdfParser, bytes: &[u8]) -> Result<usize> {

@@ -1,32 +1,30 @@
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use tracing::{info, warn};
 use wolin_core::{Principal, ResourceKind, ResourceUri, Result};
 use wolin_policy::{AccessDecision, AccessMode, PolicyEngine};
 use wolin_storage::{
-    rdf_io::{JsonLdProfileSet, RdfFormat},
-    rdf_model::{
-        GraphName, GraphNameRef, NamedNode, NamedOrBlankNode, Quad, Subject, Term, Triple,
-    },
-    rdf_sparql::{Query as SparqlQuery, QueryResults},
     ConstructGraph, PhysicalStore, RdfTerm, RdfTriple, SemanticGraphStore, SparqlBindingRow,
     SparqlBindingSet,
+    rdf_io::{JsonLdProfileSet, RdfFormat},
+    rdf_model::{GraphName, GraphNameRef, NamedNode, NamedOrBlankNode, Quad, Term, Triple},
+    rdf_sparql::{PreparedSparqlQuery, QueryResults, SparqlEvaluator},
 };
 
-use crate::projection::{project_triples, DisclosurePolicy, DisclosureProfile};
+use crate::projection::{DisclosurePolicy, DisclosureProfile, project_triples};
 use crate::protocol::{
-    JsonRpcErrorObject, JsonRpcId, JsonRpcRequest, JsonRpcResponse, McpImplementationInfo,
-    McpInitializeResult, McpListResourcesResult, McpListToolsResult, McpReadResourceResult,
-    McpResourceContents, McpResourceDescriptor, McpResourcesCapability, McpServerCapabilities,
-    McpToolCall, McpToolDescriptor, McpToolResult, McpToolsCapability, ACCESS_DENIED_ERROR,
-    DEFAULT_MCP_PROTOCOL_VERSION, INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, JSONRPC_VERSION,
-    METHOD_NOT_FOUND, PARSE_ERROR, RESOURCE_NOT_FOUND_ERROR,
+    ACCESS_DENIED_ERROR, DEFAULT_MCP_PROTOCOL_VERSION, INTERNAL_ERROR, INVALID_PARAMS,
+    INVALID_REQUEST, JSONRPC_VERSION, JsonRpcErrorObject, JsonRpcId, JsonRpcRequest,
+    JsonRpcResponse, METHOD_NOT_FOUND, McpImplementationInfo, McpInitializeResult,
+    McpListResourcesResult, McpListToolsResult, McpReadResourceResult, McpResourceContents,
+    McpResourceDescriptor, McpResourcesCapability, McpServerCapabilities, McpToolCall,
+    McpToolDescriptor, McpToolResult, McpToolsCapability, PARSE_ERROR, RESOURCE_NOT_FOUND_ERROR,
 };
 use crate::uri::{
-    base64_decode, base64_encode, compute_etag, map_named_graph_to_resolved_uri,
-    resolve_catalog_key, resolve_pod_uri, CatalogEntry, PodCatalog, ResolvedPodUri,
+    CatalogEntry, PodCatalog, ResolvedPodUri, base64_decode, base64_encode, compute_etag,
+    map_named_graph_to_resolved_uri, resolve_catalog_key, resolve_pod_uri,
 };
 
 const DEFAULT_MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
@@ -273,10 +271,10 @@ impl McpAgentServer {
                 for item in items {
                     match item {
                         Value::Object(map) => {
-                            if let Some(resp) = self.dispatch_single_object(principal, map).await {
-                                if let Ok(v) = serde_json::to_value(resp) {
-                                    responses.push(v);
-                                }
+                            if let Some(resp) = self.dispatch_single_object(principal, map).await
+                                && let Ok(v) = serde_json::to_value(resp)
+                            {
+                                responses.push(v);
                             }
                         }
                         _ => {
@@ -779,18 +777,18 @@ impl McpAgentServer {
                     .map_err(|e| {
                         JsonRpcErrorObject::new(RESOURCE_NOT_FOUND_ERROR, e.to_string())
                     })?;
-                if is_scrubbable_utf8_media_type(&entry.content_type) {
-                    if let Ok(raw_text) = String::from_utf8(bytes.clone()) {
-                        let scrubbed = self.scrub_text_for_principal(principal, &raw_text);
-                        return Ok(McpReadResourceResult {
-                            contents: vec![McpResourceContents {
-                                uri: resolved.display_uri,
-                                mime_type: Some(entry.content_type),
-                                text: Some(scrubbed),
-                                blob: None,
-                            }],
-                        });
-                    }
+                if is_scrubbable_utf8_media_type(&entry.content_type)
+                    && let Ok(raw_text) = String::from_utf8(bytes.clone())
+                {
+                    let scrubbed = self.scrub_text_for_principal(principal, &raw_text);
+                    return Ok(McpReadResourceResult {
+                        contents: vec![McpResourceContents {
+                            uri: resolved.display_uri,
+                            mime_type: Some(entry.content_type),
+                            text: Some(scrubbed),
+                            blob: None,
+                        }],
+                    });
                 }
                 let final_bytes =
                     self.scrub_binary_fallback_if_utf8_text(principal, &entry.content_type, bytes);
@@ -820,7 +818,7 @@ impl McpAgentServer {
                         JsonRpcId::Null,
                         INVALID_REQUEST,
                         msg,
-                    ))
+                    ));
                 }
             },
             None => None,
@@ -851,18 +849,18 @@ impl McpAgentServer {
         };
 
         let params = map.get("params");
-        if let Some(p) = params {
-            if !matches!(p, Value::Object(_) | Value::Array(_) | Value::Null) {
-                return if has_id_member {
-                    Some(JsonRpcResponse::error(
-                        error_id,
-                        INVALID_PARAMS,
-                        "JSON-RPC 'params' must be an object or array",
-                    ))
-                } else {
-                    None
-                };
-            }
+        if let Some(p) = params
+            && !matches!(p, Value::Object(_) | Value::Array(_) | Value::Null)
+        {
+            return if has_id_member {
+                Some(JsonRpcResponse::error(
+                    error_id,
+                    INVALID_PARAMS,
+                    "JSON-RPC 'params' must be an object or array",
+                ))
+            } else {
+                None
+            };
         }
 
         // JSON-RPC 2.0 Notification (`id` member omitted): execute silently and emit NO response.
@@ -945,17 +943,17 @@ impl McpAgentServer {
         match params {
             None | Some(Value::Null) => {}
             Some(Value::Object(obj)) => {
-                if let Some(cursor_val) = obj.get("cursor") {
-                    if !cursor_val.is_null() {
-                        let c = cursor_val.as_str().ok_or_else(|| {
-                            JsonRpcErrorObject::new(INVALID_PARAMS, "'cursor' must be a string")
-                        })?;
-                        if !c.is_empty() {
-                            return Err(JsonRpcErrorObject::new(
-                                INVALID_PARAMS,
-                                format!("Unknown tools/list cursor '{}'", sanitize_for_audit(c)),
-                            ));
-                        }
+                if let Some(cursor_val) = obj.get("cursor")
+                    && !cursor_val.is_null()
+                {
+                    let c = cursor_val.as_str().ok_or_else(|| {
+                        JsonRpcErrorObject::new(INVALID_PARAMS, "'cursor' must be a string")
+                    })?;
+                    if !c.is_empty() {
+                        return Err(JsonRpcErrorObject::new(
+                            INVALID_PARAMS,
+                            format!("Unknown tools/list cursor '{}'", sanitize_for_audit(c)),
+                        ));
                     }
                 }
             }
@@ -1120,15 +1118,19 @@ impl McpAgentServer {
         };
 
         // Parse & enforce read-only SPARQL 1.1 Query with configured Pod base IRI
-        let parsed_query = match SparqlQuery::parse(trimmed_query, Some(&self.config.base_url)) {
+        let parsed_query = match SparqlEvaluator::new()
+            .with_base_iri(&self.config.base_url)
+            .map_err(|e| format!("Invalid Pod base IRI: {e}"))
+            .and_then(|eval| {
+                eval.parse_query(trimmed_query)
+                    .map_err(|e| format!("Invalid read-only SPARQL query: {e}"))
+            }) {
             Ok(q) => q,
-            Err(e) => {
-                return McpToolResult::err_text(format!("Invalid read-only SPARQL query: {e}"))
+            Err(msg) => {
+                return McpToolResult::err_text(msg);
             }
         };
-        if contains_federated_service_clause(&parsed_query.to_string())
-            || contains_federated_service_clause(trimmed_query)
-        {
+        if contains_federated_service_clause(trimmed_query) {
             return McpToolResult::err_text(
                 "Federated SPARQL 'SERVICE' clauses are forbidden (SSRF protection)",
             );
@@ -1169,15 +1171,14 @@ impl McpAgentServer {
                         .entries
                         .get(&container_candidate)
                         .is_some_and(|e| e.kind == ResourceKind::Container)
-                    {
-                        if let Ok(upgraded) = resolve_pod_uri(
+                        && let Ok(upgraded) = resolve_pod_uri(
                             raw_target,
                             &self.config.base_url,
                             &self.config.pod_uri_prefix,
                             true,
-                        ) {
-                            resolved = upgraded;
-                        }
+                        )
+                    {
+                        resolved = upgraded;
                     }
                 }
                 if let AccessDecision::Deny { reason } =
@@ -1212,7 +1213,7 @@ impl McpAgentServer {
                 Err(e) => {
                     return McpToolResult::err_text(format!(
                         "Oxigraph named_graphs read failed: {e}"
-                    ))
+                    ));
                 }
             }
         }
@@ -1238,14 +1239,14 @@ impl McpAgentServer {
                 _ => continue,
             }
 
-            if let Some(ref filter) = scoped_target {
-                if !target_scope_matches_graph(
+            if let Some(ref filter) = scoped_target
+                && !target_scope_matches_graph(
                     &filter.policy_target.0,
                     filter.is_container,
                     &graph_resolved.policy_target.0,
-                ) {
-                    continue;
-                }
+                )
+            {
+                continue;
             }
 
             match self.evaluate_pdp(principal, &graph_resolved.policy_target, AccessMode::Read) {
@@ -1303,7 +1304,7 @@ impl McpAgentServer {
                     Err(e) => {
                         return McpToolResult::err_text(format!(
                             "Oxigraph default graph read failed: {e}"
-                        ))
+                        ));
                     }
                 }
             }
@@ -1383,10 +1384,10 @@ impl McpAgentServer {
             Ok(Err(join_err)) => {
                 return McpToolResult::err_text(format!(
                     "SPARQL worker execution error: {join_err}"
-                ))
+                ));
             }
             Err(_) => {
-                return McpToolResult::err_text("SPARQL query exceeded execution time budget (5s)")
+                return McpToolResult::err_text("SPARQL query exceeded execution time budget (5s)");
             }
         };
 
@@ -1612,24 +1613,24 @@ impl McpAgentServer {
                     Err(e) => return McpToolResult::err_text(e.to_string()),
                 };
 
-                if is_scrubbable_utf8_media_type(&entry.content_type) {
-                    if let Ok(raw_text) = String::from_utf8(bytes.clone()) {
-                        let scrubbed = self.scrub_text_for_principal(principal, &raw_text);
-                        let effective_etag = if restricted_caller && scrubbed != raw_text {
-                            compute_etag(scrubbed.as_bytes())
-                        } else {
-                            entry.etag
-                        };
-                        return McpToolResult::ok_json(&json!({
-                            "uri": resolved.display_uri,
-                            "kind": entry.kind,
-                            "content_type": entry.content_type,
-                            "etag": effective_etag,
-                            "encoding": "utf-8",
-                            "data": scrubbed,
-                            "redacted_triples": 0,
-                        }));
-                    }
+                if is_scrubbable_utf8_media_type(&entry.content_type)
+                    && let Ok(raw_text) = String::from_utf8(bytes.clone())
+                {
+                    let scrubbed = self.scrub_text_for_principal(principal, &raw_text);
+                    let effective_etag = if restricted_caller && scrubbed != raw_text {
+                        compute_etag(scrubbed.as_bytes())
+                    } else {
+                        entry.etag
+                    };
+                    return McpToolResult::ok_json(&json!({
+                        "uri": resolved.display_uri,
+                        "kind": entry.kind,
+                        "content_type": entry.content_type,
+                        "etag": effective_etag,
+                        "encoding": "utf-8",
+                        "data": scrubbed,
+                        "redacted_triples": 0,
+                    }));
                 }
 
                 let orig_etag = entry.etag;
@@ -1894,12 +1895,11 @@ impl McpAgentServer {
                 {
                     return McpToolResult::err_text(e.to_string());
                 }
-                if let Some(ref prev) = existing {
-                    if prev.kind == ResourceKind::NonRdfSource {
-                        if let Err(e) = self.physical_store.delete(&resolved.blob_key).await {
-                            return McpToolResult::err_text(e.to_string());
-                        }
-                    }
+                if let Some(ref prev) = existing
+                    && prev.kind == ResourceKind::NonRdfSource
+                    && let Err(e) = self.physical_store.delete(&resolved.blob_key).await
+                {
+                    return McpToolResult::err_text(e.to_string());
                 }
                 (
                     ResourceKind::RdfSource,
@@ -1920,12 +1920,11 @@ impl McpAgentServer {
                 {
                     return McpToolResult::err_text(e.to_string());
                 }
-                if let Some(ref prev) = existing {
-                    if prev.kind == ResourceKind::RdfSource {
-                        if let Err(e) = self.graph_store.delete_named_graph(&resolved.graph_iri) {
-                            return McpToolResult::err_text(e.to_string());
-                        }
-                    }
+                if let Some(ref prev) = existing
+                    && prev.kind == ResourceKind::RdfSource
+                    && let Err(e) = self.graph_store.delete_named_graph(&resolved.graph_iri)
+                {
+                    return McpToolResult::err_text(e.to_string());
                 }
                 (ResourceKind::NonRdfSource, content_type, etag, None)
             }
@@ -2155,10 +2154,11 @@ impl McpAgentServer {
             .next()
             .unwrap_or(content_type)
             .trim();
-        if primary == "application/octet-stream" && !bytes.contains(&0) {
-            if let Ok(text) = std::str::from_utf8(&bytes) {
-                return self.scrub_text_for_principal(principal, text).into_bytes();
-            }
+        if primary == "application/octet-stream"
+            && !bytes.contains(&0)
+            && let Ok(text) = std::str::from_utf8(&bytes)
+        {
+            return self.scrub_text_for_principal(principal, text).into_bytes();
         }
         bytes
     }
@@ -2181,7 +2181,7 @@ impl McpAgentServer {
             let rdf_type_node = NamedNode::new(RDF_TYPE).unwrap();
             for type_iri in [LDP_BASIC_CONTAINER, LDP_CONTAINER, LDP_RESOURCE] {
                 triples.push(Triple::new(
-                    Subject::NamedNode(container_node.clone()),
+                    NamedOrBlankNode::NamedNode(container_node.clone()),
                     rdf_type_node.clone(),
                     Term::NamedNode(NamedNode::new(type_iri).unwrap()),
                 ));
@@ -2212,7 +2212,7 @@ impl McpAgentServer {
                 }
                 if let Ok(child_node) = NamedNode::new(&child_res.graph_iri) {
                     triples.push(Triple::new(
-                        Subject::NamedNode(container_node.clone()),
+                        NamedOrBlankNode::NamedNode(container_node.clone()),
                         contains_pred.clone(),
                         Term::NamedNode(child_node),
                     ));
@@ -2226,7 +2226,7 @@ impl McpAgentServer {
 
 fn execute_bounded_sparql_in_sandbox(
     staged_quads: Vec<Quad>,
-    parsed_query: SparqlQuery,
+    parsed_query: PreparedSparqlQuery,
     limit: usize,
 ) -> std::result::Result<BoundedSparqlOutput, String> {
     let sandbox = SemanticGraphStore::new_in_memory().map_err(|e| e.to_string())?;
@@ -2234,9 +2234,9 @@ fn execute_bounded_sparql_in_sandbox(
         .insert_quads(staged_quads)
         .map_err(|e| e.to_string())?;
 
-    let results = sandbox
-        .inner()
-        .query(parsed_query)
+    let results = parsed_query
+        .on_store(sandbox.inner())
+        .execute()
         .map_err(|e| format!("SPARQL query evaluation failed: {e}"))?;
 
     match results {

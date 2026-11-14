@@ -1,32 +1,32 @@
 use std::sync::Arc;
 
 use axum::{
+    Json,
     body::to_bytes,
     extract::{Path, Request, State},
-    http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode, Uri},
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri, header},
     response::{IntoResponse, Response},
-    Json,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use wolin_core::{Principal, ResourceKind};
 use wolin_identity::DidResolver;
 use wolin_storage::{
-    rdf_io::RdfFormat,
-    rdf_model::{Literal, NamedNode, Subject, Term, Triple},
     SemanticGraphStore,
+    rdf_io::RdfFormat,
+    rdf_model::{Literal, NamedNode, NamedOrBlankNode, Term, Triple},
 };
 
 use crate::{
+    AppState, LdpConfig,
     auth::{effective_scheme, extract_principal_for_request},
     error::LdpError,
     ldp::{
-        acl_rule_prefix, blob_key_for_path, build_ldp_target_from_canonical, compute_etag,
-        extract_wac_rules_from_acl_triples, http_iri, LdpCatalog, LdpEntry, FOAF_PERSON,
-        FOAF_PERSONAL_PROFILE_DOCUMENT, LDP_INBOX_REL, PIM_STORAGE, PIM_STORAGE_REL,
-        SOLID_OIDC_ISSUER,
+        FOAF_PERSON, FOAF_PERSONAL_PROFILE_DOCUMENT, LDP_INBOX_REL, LdpCatalog, LdpEntry,
+        PIM_STORAGE, PIM_STORAGE_REL, SOLID_OIDC_ISSUER, acl_rule_prefix, blob_key_for_path,
+        build_ldp_target_from_canonical, compute_etag, extract_wac_rules_from_acl_triples,
+        http_iri,
     },
-    AppState, LdpConfig,
 };
 
 const MAX_POD_ID_LEN: usize = 63;
@@ -774,7 +774,11 @@ fn named_triple(subj: &str, pred: &str, obj: &str) -> Result<Triple, LdpError> {
         .map_err(|e| LdpError::Internal(format!("Invalid RDF predicate IRI '{pred}': {e}")))?;
     let o = NamedNode::new(obj)
         .map_err(|e| LdpError::BadRequest(format!("Invalid RDF object IRI '{obj}': {e}")))?;
-    Ok(Triple::new(Subject::NamedNode(s), p, Term::NamedNode(o)))
+    Ok(Triple::new(
+        NamedOrBlankNode::NamedNode(s),
+        p,
+        Term::NamedNode(o),
+    ))
 }
 
 fn literal_triple(subj: &str, pred: &str, literal_value: &str) -> Result<Triple, LdpError> {
@@ -783,7 +787,7 @@ fn literal_triple(subj: &str, pred: &str, literal_value: &str) -> Result<Triple,
     let p = NamedNode::new(pred)
         .map_err(|e| LdpError::Internal(format!("Invalid RDF predicate IRI '{pred}': {e}")))?;
     Ok(Triple::new(
-        Subject::NamedNode(s),
+        NamedOrBlankNode::NamedNode(s),
         p,
         Term::Literal(Literal::new_simple_literal(literal_value)),
     ))

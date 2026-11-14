@@ -6,11 +6,11 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use oxigraph::io::{JsonLdProfileSet, RdfFormat, RdfParser};
-use oxigraph::model::{Subject, Term};
-use ring::digest::{digest, SHA256};
+use oxigraph::model::{NamedOrBlankNode, Term};
+use ring::digest::{SHA256, digest};
 use ring::signature::{
-    RsaPublicKeyComponents, UnparsedPublicKey, ECDSA_P256_SHA256_FIXED, ECDSA_P384_SHA384_FIXED,
-    ED25519, RSA_PKCS1_2048_8192_SHA256, RSA_PSS_2048_8192_SHA256,
+    ECDSA_P256_SHA256_FIXED, ECDSA_P384_SHA384_FIXED, ED25519, RSA_PKCS1_2048_8192_SHA256,
+    RSA_PSS_2048_8192_SHA256, RsaPublicKeyComponents, UnparsedPublicKey,
 };
 use serde::{Deserialize, Serialize};
 use wolin_core::{Result, WolinError};
@@ -99,7 +99,7 @@ impl WebIdProfile {
             let quad = quad_res.map_err(|e| {
                 WolinError::Unauthenticated(format!("Malformed WebID Profile RDF payload: {e}"))
             })?;
-            let Subject::NamedNode(ref subj_node) = quad.subject else {
+            let NamedOrBlankNode::NamedNode(ref subj_node) = quad.subject else {
                 continue;
             };
             if subj_node.as_str() != webid {
@@ -639,12 +639,12 @@ pub fn verify_dpop_proof(
                 "DPoP proof 'ath' hash does not match presented access token".to_string(),
             ));
         }
-    } else if let Some(ref ath) = raw_payload.ath {
-        if ath.trim().is_empty() {
-            return Err(WolinError::Unauthenticated(
-                "DPoP proof 'ath' claim must not be empty".to_string(),
-            ));
-        }
+    } else if let Some(ref ath) = raw_payload.ath
+        && ath.trim().is_empty()
+    {
+        return Err(WolinError::Unauthenticated(
+            "DPoP proof 'ath' claim must not be empty".to_string(),
+        ));
     }
 
     if let Some(cache) = ctx.replay_cache {

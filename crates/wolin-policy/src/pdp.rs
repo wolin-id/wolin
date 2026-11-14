@@ -228,7 +228,7 @@ impl PolicyEngine {
             Err(_) => {
                 return AccessDecision::Deny {
                     reason: "System clock error: unable to verify policy timestamps".to_string(),
-                }
+                };
             }
         };
         self.evaluate_policy_at(principal, target, mode, now)
@@ -357,10 +357,10 @@ impl PolicyEngine {
                         if grant.revoked {
                             return false;
                         }
-                        if let Some(exp) = grant.expires_at {
-                            if now_epoch_secs >= exp {
-                                return false;
-                            }
+                        if let Some(exp) = grant.expires_at
+                            && now_epoch_secs >= exp
+                        {
+                            return false;
                         }
                         if !modes_satisfy(&grant.allowed_modes, mode, false) {
                             return false;
@@ -521,7 +521,7 @@ fn acp_resource_matches_for_deny(policy: &AcpPolicy, target: &str) -> bool {
     for container in &policy.inherited_containers {
         match canonicalize_policy_pattern(&container.0) {
             Some(pat) if pat == "/" || uri_matches_target_or_container(target, &pat) => {
-                return true
+                return true;
             }
             Some(_) => {}
             None => return true,
@@ -582,18 +582,16 @@ fn agent_scope_allows(scopes: &[String], canonical_target: &str, mode: AccessMod
         if s == "*" || scope_token_satisfies(s, mode) {
             return true;
         }
-        if let Some((prefix_mode, resource_scope)) = s.split_once(':') {
-            if matches!(
+        if let Some((prefix_mode, resource_scope)) = s.split_once(':')
+            && matches!(
                 prefix_mode,
                 "read" | "append" | "write" | "control" | "admin"
-            ) && scope_token_satisfies(prefix_mode, mode)
-            {
-                if let Some(canonical_scope) = canonicalize_policy_pattern(resource_scope) {
-                    if uri_matches_target_or_container(canonical_target, &canonical_scope) {
-                        return true;
-                    }
-                }
-            }
+            )
+            && scope_token_satisfies(prefix_mode, mode)
+            && let Some(canonical_scope) = canonicalize_policy_pattern(resource_scope)
+            && uri_matches_target_or_container(canonical_target, &canonical_scope)
+        {
+            return true;
         }
     }
     false
@@ -975,14 +973,16 @@ mod tests {
             delegated_by: alice_id.clone(),
             scope: vec!["read".to_string()],
         };
-        assert!(!engine
-            .evaluate_policy_at(
-                &agent,
-                &ResourceUri("wolin://acme/doc.ttl".to_string()),
-                AccessMode::Read,
-                1000
-            )
-            .is_permit());
+        assert!(
+            !engine
+                .evaluate_policy_at(
+                    &agent,
+                    &ResourceUri("wolin://acme/doc.ttl".to_string()),
+                    AccessMode::Read,
+                    1000
+                )
+                .is_permit()
+        );
 
         engine.add_delegation_grant(DelegationGrant {
             grant_id: "g-exp".to_string(),
@@ -1079,9 +1079,11 @@ mod tests {
         // Percent-encoded UTF-8 (`문서`/`기밀`) + `%3a` must canonicalize identically and hit ACP deny
         let encoded_attempt =
             ResourceUri("wolin://corp/%EB%AC%B8%EC%84%9C/%EA%B8%B0%EB%B0%80%3av1.ttl".to_string());
-        assert!(!engine
-            .evaluate_policy_at(&alice, &encoded_attempt, AccessMode::Read, 1000)
-            .is_permit());
+        assert!(
+            !engine
+                .evaluate_policy_at(&alice, &encoded_attempt, AccessMode::Read, 1000)
+                .is_permit()
+        );
 
         // Malformed pattern in ACP deny must fail closed (block rather than skip)
         let mut bad_deny_engine = PolicyEngine::new();
@@ -1102,13 +1104,15 @@ mod tests {
             allow: vec![],
             deny: vec![AccessMode::Read],
         });
-        assert!(!bad_deny_engine
-            .evaluate_policy_at(
-                &alice,
-                &ResourceUri("wolin://corp/any.ttl".to_string()),
-                AccessMode::Read,
-                1000
-            )
-            .is_permit());
+        assert!(
+            !bad_deny_engine
+                .evaluate_policy_at(
+                    &alice,
+                    &ResourceUri("wolin://corp/any.ttl".to_string()),
+                    AccessMode::Read,
+                    1000
+                )
+                .is_permit()
+        );
     }
 }

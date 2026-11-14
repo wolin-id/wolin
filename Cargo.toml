@@ -11,11 +11,9 @@ members = [
 
 [workspace.package]
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 authors = ["Entropy Paradox, Inc."]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/wolin-id/wolin"
-homepage = "https://wolin.id"
 
 [workspace.dependencies]
 # Internal workspace crates
@@ -26,27 +24,26 @@ wolin-policy = { path = "crates/wolin-policy" }
 wolin-mcp = { path = "crates/wolin-mcp" }
 
 # Async & Web
-tokio = { version = "1.41", features = ["full"] }
+tokio = { version = "1.54", features = ["full"] }
 axum = { version = "0.8", features = ["macros"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.7", features = ["cors", "trace"] }
 
 # Serialization & Utils
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-uuid = { version = "1.10", features = ["v4", "serde"] }
-chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.29", features = ["v4", "serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 thiserror = "2.0"
 anyhow = "1.0"
 
 # Semantic & Storage
-oxigraph = "0.4"
-opendal = { version = "0.51", features = ["services-fs", "services-memory"] }
+oxigraph = "0.5"
+opendal = { version = "0.59", features = ["services-fs", "services-memory"] }
 
 # Crypto & Federated HTTP
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "stream"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
 ring = "0.17"
 
 [profile.release]

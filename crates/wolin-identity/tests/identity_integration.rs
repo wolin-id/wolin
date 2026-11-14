@@ -88,10 +88,12 @@ fn did_nostr_resolution_and_validation() {
     );
 
     // Uppercase hex, wrong length, and all-zero pubkey must be rejected
-    assert!(DidResolver::resolve_principal(
-        "did:nostr:7E7E9C42A91BFEF19FA929E5FDA1B72E0EBC1A4C1141673E2794234D86ADDF4E"
-    )
-    .is_err());
+    assert!(
+        DidResolver::resolve_principal(
+            "did:nostr:7E7E9C42A91BFEF19FA929E5FDA1B72E0EBC1A4C1141673E2794234D86ADDF4E"
+        )
+        .is_err()
+    );
     assert!(DidResolver::resolve_principal("did:nostr:abcd1234").is_err());
     assert!(DidResolver::resolve_principal(&format!("did:nostr:{}", "0".repeat(64))).is_err());
 }

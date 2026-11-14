@@ -1,7 +1,7 @@
 use serde::de::{self, Deserializer, Visitor};
 use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub const JSONRPC_VERSION: &str = "2.0";
 pub const DEFAULT_MCP_PROTOCOL_VERSION: &str = "2024-11-05";
