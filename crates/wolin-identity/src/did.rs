@@ -6,8 +6,7 @@ use wolin_core::{Principal, Result, WebId, WolinError};
 const MAX_DID_LEN: usize = 2048;
 const MAX_MULTIBASE_LEN: usize = 512;
 const MAX_AGENT_SCOPES: usize = 128;
-const BASE58BTC_ALPHABET: &[u8; 58] =
-    b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+const BASE58BTC_ALPHABET: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
 /// Supported W3C / Sovereign DID methods in Wolin
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

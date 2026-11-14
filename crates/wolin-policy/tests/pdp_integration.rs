@@ -64,8 +64,7 @@ fn wac_container_inheritance_and_segment_boundary_safety() {
     let mut engine = PolicyEngine::new();
     let alice_id = WebId("did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".to_string()); // gitleaks:allow
     let bob_id = WebId(
-        "did:nostr:7e7e9c42a91bfef19fa929e5fda1b72e0ebc1a4c1141673e2794234d86addf4e"
-            .to_string(),
+        "did:nostr:7e7e9c42a91bfef19fa929e5fda1b72e0ebc1a4c1141673e2794234d86addf4e".to_string(),
     );
 
     engine.add_wac_rule(WacRule {

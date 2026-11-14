@@ -153,9 +153,8 @@ impl PolicyEngine {
     /// Remove revoked or expired delegation grants at `now_epoch_secs`, returning removed count.
     pub fn prune_expired_delegations(&mut self, now_epoch_secs: i64) -> usize {
         let before = self.delegation_grants.len();
-        self.delegation_grants.retain(|g| {
-            !g.revoked && g.expires_at.is_none_or(|exp| now_epoch_secs < exp)
-        });
+        self.delegation_grants
+            .retain(|g| !g.revoked && g.expires_at.is_none_or(|exp| now_epoch_secs < exp));
         before - self.delegation_grants.len()
     }
 
@@ -367,8 +366,9 @@ impl PolicyEngine {
                             return false;
                         }
                         grant.resource_scopes.iter().any(|res| {
-                            canonicalize_policy_pattern(&res.0)
-                                .is_some_and(|pat| uri_matches_target_or_container(target_str, &pat))
+                            canonicalize_policy_pattern(&res.0).is_some_and(|pat| {
+                                uri_matches_target_or_container(target_str, &pat)
+                            })
                         })
                     });
 
@@ -548,7 +548,9 @@ fn acp_subject_matches(policy: &AcpPolicy, ctx: &SubjectContext<'_>) -> bool {
 
 fn modes_satisfy(granted: &[AccessMode], requested: AccessMode, write_denied: bool) -> bool {
     granted.contains(&requested)
-        || (requested == AccessMode::Append && !write_denied && granted.contains(&AccessMode::Write))
+        || (requested == AccessMode::Append
+            && !write_denied
+            && granted.contains(&AccessMode::Write))
 }
 
 fn modes_deny(denied: &[AccessMode], requested: AccessMode) -> bool {
@@ -643,9 +645,9 @@ fn canonicalize_resource_uri(s: &str) -> std::result::Result<String, String> {
     if s.is_empty() || s.len() > MAX_RESOURCE_URI_LEN {
         return Err("Invalid resource URI: empty or exceeds maximum length".to_string());
     }
-    if s.bytes()
-        .any(|b| b.is_ascii_control() || b.is_ascii_whitespace() || matches!(b, b'\\' | b'?' | b'#'))
-    {
+    if s.bytes().any(|b| {
+        b.is_ascii_control() || b.is_ascii_whitespace() || matches!(b, b'\\' | b'?' | b'#')
+    }) {
         return Err(
             "Invalid resource URI: query, fragment, backslash, whitespace, or control byte rejected"
                 .to_string(),
@@ -691,7 +693,9 @@ fn canonicalize_resource_uri(s: &str) -> std::result::Result<String, String> {
         if let Some(path) = path_opt {
             for seg in path.split('/') {
                 if seg.is_empty() {
-                    return Err("Invalid resource URI: empty '//' path segment rejected".to_string());
+                    return Err(
+                        "Invalid resource URI: empty '//' path segment rejected".to_string()
+                    );
                 }
                 let clean_seg = decode_and_validate_uri_segment(seg)?;
                 canonical.push('/');
@@ -793,9 +797,7 @@ fn infer_did_issuer(webid: &str) -> Option<String> {
         if host_seg.is_empty() {
             return None;
         }
-        let decoded_host = host_seg
-            .to_ascii_lowercase()
-            .replace("%3a", ":");
+        let decoded_host = host_seg.to_ascii_lowercase().replace("%3a", ":");
         Some(format!("did:web:{decoded_host}"))
     } else {
         None
