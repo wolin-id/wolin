@@ -1,0 +1,16 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+authors:
+  - name: "Entropy Paradox, Inc. and Wolin Contributors"
+title: "Wolin (月印千江): Sovereign Web3 Identity & Semantic Pod Cloud Engine"
+version: 0.1.0
+url: "https://wolin.id"
+repository-code: "https://github.com/wolin-id/wolin"
+license: "MIT OR Apache-2.0"
+keywords:
+  - solid-protocol
+  - webid
+  - rdf
+  - sparql
+  - decentralized-identity
+  - rust

@@ -14,7 +14,8 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Entropy Paradox, Inc."]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/entropyparadox/wolin"
+repository = "https://github.com/wolin-id/wolin"
+homepage = "https://wolin.id"
 
 [workspace.dependencies]
 # Internal workspace crates
