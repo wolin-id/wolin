@@ -43,7 +43,7 @@ anyhow = "1.0"
 
 # Semantic & Storage
 oxigraph = "0.4"
-opendal = { version = "0.51", features = ["services-fs", "services-memory"] }
+opendal = { version = "0.59", features = ["services-fs", "services-memory"] }
 
 # Crypto & Federated HTTP
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "stream"] }
