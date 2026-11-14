@@ -1,0 +1,40 @@
+name: "Bug Report"
+description: "Report a reproducible defect or protocol compliance issue."
+title: "[BUG]: "
+labels: ["bug", "triage"]
+body:
+  - type: dropdown
+    id: component
+    attributes:
+      label: Crate / Component
+      options:
+        - wolin-core
+        - wolin-storage
+        - wolin-identity
+        - wolin-policy
+        - wolin-mcp
+        - wolin-server
+        - docs
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to Reproduce
+      placeholder: "Provide minimal reproduction steps or failing test case."
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      placeholder: "e.g., Linux x86_64, Rust 1.84, wolin-server 0.1.0"
+    validations:
+      required: true
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Privacy Check
+      options:
+        - label: "I confirm that no private keys, tokens, credentials, or personal data are included."
+          required: true

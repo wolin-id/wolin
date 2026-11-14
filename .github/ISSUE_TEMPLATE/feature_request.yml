@@ -1,0 +1,17 @@
+name: "Feature Request"
+description: "Propose a Solid specification feature, storage backend, or self-hosting improvement."
+title: "[FEAT]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary & Motivation
+      placeholder: "Describe the capability and why it fits Wolin's architecture."
+    validations:
+      required: true
+  - type: textarea
+    id: spec
+    attributes:
+      label: Proposed Interface / Specification Reference
+      placeholder: "Link relevant W3C Solid / IETF RFC specs if applicable."
