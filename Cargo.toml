@@ -42,7 +42,7 @@ thiserror = "2.0"
 anyhow = "1.0"
 
 # Semantic & Storage
-oxigraph = "0.4"
+oxigraph = "0.5"
 opendal = { version = "0.51", features = ["services-fs", "services-memory"] }
 
 # Crypto & Federated HTTP
