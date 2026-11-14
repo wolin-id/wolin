@@ -37,9 +37,11 @@ wolin/
 - **Memory Footprint**:
   - Ephemeral In-Memory: **15.3 MiB RSS** (~5.9 ms startup)
   - Persistent RocksDB + FS: **21.4 MiB RSS** (idle) / **23.9 MiB RSS** (under live workload)
-- **Workspace Verification**: **63/63** passing unit & integration tests (`cargo test --locked --workspace`).
+- **Workspace Verification**: **67/67** passing unit & integration tests (`cargo test --locked --workspace`).
 
 ## 3. Quickstart
+
+> For Docker Compose, Caddy automatic HTTPS, Cloudflare Tunnel, and Raspberry Pi / `systemd` deployment, see **[docs/SELF_HOSTING.md](docs/SELF_HOSTING.md)**.
 
 ```bash
 # Run full workspace test suite

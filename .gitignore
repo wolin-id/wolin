@@ -1,4 +1,8 @@
 /target
 **/*.rs.bk
 .env
+.env.*
+!.env.example
+/data
+deploy/Caddyfile
 .DS_Store

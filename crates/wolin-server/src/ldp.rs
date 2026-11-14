@@ -1462,6 +1462,7 @@ fn parse_ldp_path_str(raw_path: &str, pod_prefix: &str) -> Result<LdpTarget, Ldp
         if idx == 0
             && (decoded == ".well-known"
                 || decoded == "health"
+                || decoded == "healthz"
                 || decoded == "mcp"
                 || decoded == "api")
         {

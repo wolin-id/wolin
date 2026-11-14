@@ -215,7 +215,9 @@ fn canonicalize_ldp_path(raw_path: &str) -> Result<(String, bool, bool)> {
                 || decoded.starts_with("__wolin_")
                 || decoded == ".well-known"
                 || decoded == "health"
-                || decoded == "mcp")
+                || decoded == "healthz"
+                || decoded == "mcp"
+                || decoded == "api")
         {
             return Err(WolinError::InvalidFormat(format!(
                 "Reserved system path segment '{decoded}' cannot be accessed"

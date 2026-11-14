@@ -1,0 +1,94 @@
+name: wolin
+
+services:
+  wolin:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: ghcr.io/wolin-id/wolin:latest
+    container_name: wolin-server
+    restart: unless-stopped
+    env_file:
+      - path: ../.env
+        required: false
+      - path: ./.env
+        required: false
+    ports:
+      - "${WOLIN_HTTP_BIND:-127.0.0.1:4000}:${WOLIN_CONTAINER_PORT:-4000}"
+    volumes:
+      - wolin_data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/wolin-server", "--healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - wolin_net
+
+  # Optional Caddy reverse proxy with automatic Let's Encrypt / ZeroSSL HTTPS.
+  # Preparation: cp deploy/Caddyfile.example deploy/Caddyfile
+  # Start with:  docker compose --env-file .env -f deploy/docker-compose.yml --profile caddy up -d
+  caddy:
+    image: caddy:2-alpine
+    container_name: wolin-caddy
+    profiles:
+      - caddy
+    restart: unless-stopped
+    depends_on:
+      wolin:
+        condition: service_healthy
+    env_file:
+      - path: ../.env
+        required: false
+      - path: ./.env
+        required: false
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ${WOLIN_CADDYFILE:-./Caddyfile.example}:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - wolin_net
+
+  # Optional Cloudflare Tunnel sidecar (zero inbound port-forwarding / CGNAT home servers).
+  # 1. Uncomment the `cloudflared` block below.
+  # 2. Set CLOUDFLARE_TUNNEL_TOKEN in .env and point your tunnel public hostname to http://wolin:4000.
+  # 3. Set WOLIN_BASE_URL=https://pod.yourdomain.com in .env and run:
+  #    docker compose --env-file .env -f deploy/docker-compose.yml up -d
+  #
+  # cloudflared:
+  #   image: cloudflare/cloudflared:2025.2.1
+  #   container_name: wolin-cloudflared
+  #   restart: unless-stopped
+  #   depends_on:
+  #     wolin:
+  #       condition: service_healthy
+  #   security_opt:
+  #     - no-new-privileges:true
+  #   environment:
+  #     TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN}
+  #   command: tunnel --no-autoupdate run
+  #   networks:
+  #     - wolin_net
+
+volumes:
+  wolin_data:
+  caddy_data:
+  caddy_config:
+
+networks:
+  wolin_net:
+    driver: bridge

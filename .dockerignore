@@ -1,0 +1,10 @@
+.git
+.github
+target
+data
+**/.env
+**/.env.*
+!**/.env.example
+deploy/Caddyfile
+**/*.rs.bk
+.DS_Store

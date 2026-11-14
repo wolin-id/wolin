@@ -6,7 +6,7 @@ pub mod ldp;
 pub mod mcp;
 pub mod pods;
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
@@ -14,7 +14,7 @@ use axum::{
     Router,
     extract::State,
     response::Json,
-    routing::{get, post},
+    routing::{any, get, post},
 };
 use ldp::LdpCatalog;
 use serde_json::json;
@@ -48,6 +48,8 @@ pub struct LdpConfig {
     pub pod_cloud_domain: String,
     /// Optional Solid-OIDC external WebID RDF Profile dereferencer.
     pub webid_dereferencer: Option<Arc<dyn WebIdDereferencer>>,
+    /// Whether the Native MCP HTTP/SSE gateway (`/mcp`, `/mcp/sse`) is enabled.
+    pub mcp_enabled: bool,
 }
 
 impl Default for LdpConfig {
@@ -64,6 +66,7 @@ impl Default for LdpConfig {
             policy_clock_epoch_secs: None,
             pod_cloud_domain: "wolin.cloud".to_string(),
             webid_dereferencer: default_deref,
+            mcp_enabled: true,
         }
     }
 }
@@ -109,6 +112,11 @@ impl LdpConfig {
 
     pub fn without_webid_dereferencer(mut self) -> Self {
         self.webid_dereferencer = None;
+        self
+    }
+
+    pub fn with_mcp_enabled(mut self, enabled: bool) -> Self {
+        self.mcp_enabled = enabled;
         self
     }
 }
@@ -254,13 +262,24 @@ fn ensure_private_dir(path: &Path) -> wolin_core::Result<()> {
 /// Build the Axum 0.8 router serving system discovery, Native MCP (`/mcp`, `/mcp/sse`),
 /// and the Solid LDP + WAC/ACP pipeline (`/*path` & `/pods/{pod_id}/{*path}`).
 pub fn build_router(state: Arc<AppState>) -> Router {
-    Router::new()
+    let mut router = Router::new()
         .route("/health", get(health_check))
+        .route("/healthz", get(health_check))
         .route("/.well-known/wolin", get(well_known_wolin))
         .route("/api/pods", post(pods::handle_provision_pod))
-        .route("/api/pods/{pod_id}", get(pods::handle_get_pod_info))
-        .route("/mcp", post(mcp::handle_mcp_post))
-        .route("/mcp/sse", get(mcp::handle_mcp_sse))
+        .route("/api/pods/{pod_id}", get(pods::handle_get_pod_info));
+
+    router = if state.config.mcp_enabled {
+        router
+            .route("/mcp", post(mcp::handle_mcp_post))
+            .route("/mcp/sse", get(mcp::handle_mcp_sse))
+    } else {
+        router
+            .route("/mcp", any(mcp::handle_mcp_disabled))
+            .route("/mcp/sse", any(mcp::handle_mcp_disabled))
+    };
+
+    router
         .fallback(ldp::handle_ldp_request)
         .layer(
             TraceLayer::new_for_http()
@@ -279,36 +298,51 @@ pub async fn health_check() -> Json<serde_json::Value> {
 }
 
 pub async fn well_known_wolin(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let mcp_tools: Vec<String> = state
-        .mcp_server
-        .list_tools()
-        .into_iter()
-        .map(|t| t.name)
-        .collect();
+    let mcp_enabled = state.config.mcp_enabled;
+    let mcp_tools: Vec<String> = if mcp_enabled {
+        state
+            .mcp_server
+            .list_tools()
+            .into_iter()
+            .map(|t| t.name)
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let mut protocols = vec!["solid-0.11", "wac-2.0", "acp-1.0", "oidc-1.0"];
+    if mcp_enabled {
+        protocols.insert(3, "mcp-2024-11-05");
+    }
+
+    let mut endpoints = serde_json::Map::from_iter([
+        ("health".to_string(), json!("/health")),
+        ("healthz".to_string(), json!("/healthz")),
+        ("discovery".to_string(), json!("/.well-known/wolin")),
+        ("ldp_root".to_string(), json!("/")),
+        ("pods".to_string(), json!("/pods/")),
+        ("pod_provisioning".to_string(), json!("/api/pods")),
+    ]);
+    if mcp_enabled {
+        endpoints.insert("mcp".to_string(), json!("/mcp"));
+        endpoints.insert("mcp_sse".to_string(), json!("/mcp/sse"));
+    }
 
     Json(json!({
         "wolin_version": env!("CARGO_PKG_VERSION"),
         "base_url": state.config.base_url,
         "pod_uri_prefix": state.config.pod_uri_prefix,
-        "protocols": ["solid-0.11", "wac-2.0", "acp-1.0", "mcp-2024-11-05", "oidc-1.0"],
+        "protocols": protocols,
         "storage_backend": "opendal+oxigraph",
         "identity_mesh": ["webid", "did:key", "did:web", "did:nostr", "zitadel-oidc"],
-        "endpoints": {
-            "health": "/health",
-            "discovery": "/.well-known/wolin",
-            "ldp_root": "/",
-            "pods": "/pods/",
-            "pod_provisioning": "/api/pods",
-            "mcp": "/mcp",
-            "mcp_sse": "/mcp/sse"
-        },
+        "endpoints": endpoints,
         "capabilities": {
             "solid_ldp": true,
             "solid_oidc_dpop": true,
             "multi_tenant_pod_cloud": true,
             "wac_acp_pdp": true,
-            "mcp_jsonrpc": true,
-            "mcp_sse": true,
+            "mcp_jsonrpc": mcp_enabled,
+            "mcp_sse": mcp_enabled,
             "zero_pii_projection": true,
             "mcp_tools": mcp_tools
         }
@@ -328,6 +362,7 @@ pub struct ServerCliConfig {
     pub oidc_audience: Option<String>,
     pub owner_webid: Option<String>,
     pub require_explicit_delegation: bool,
+    pub mcp_enabled: bool,
     pub max_body_bytes: usize,
 }
 
@@ -344,12 +379,27 @@ impl Default for ServerCliConfig {
             oidc_audience: None,
             owner_webid: None,
             require_explicit_delegation: false,
+            mcp_enabled: true,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
         }
     }
 }
 
 impl ServerCliConfig {
+    pub fn listen_addr(&self) -> SocketAddr {
+        SocketAddr::new(self.host, self.port)
+    }
+
+    /// Loopback/interface socket address targeted by `--healthcheck`.
+    pub fn healthcheck_addr(&self) -> SocketAddr {
+        let ip = match self.host {
+            IpAddr::V4(v4) if v4.is_unspecified() => IpAddr::from([127, 0, 0, 1]),
+            IpAddr::V6(v6) if v6.is_unspecified() => IpAddr::from([0, 0, 0, 0, 0, 0, 0, 1]),
+            concrete => concrete,
+        };
+        SocketAddr::new(ip, self.port)
+    }
+
     pub fn effective_base_url(&self) -> String {
         match &self.base_url {
             Some(url) => url.trim_end_matches('/').to_string(),
@@ -364,6 +414,7 @@ impl ServerCliConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliParseOutcome {
     Run(ServerCliConfig),
+    Healthcheck(ServerCliConfig),
     Help(String),
     Version(String),
 }
@@ -374,35 +425,57 @@ impl ServerCliConfig {
             "wolin-server {} — Universal Identity & Sovereign Pod Persistence Fabric\n\n\
              USAGE:\n  \
                wolin-server [OPTIONS]\n\n\
+             PRECEDENCE:\n  \
+               CLI flag > WOLIN_* environment variable > built-in default\n\n\
              OPTIONS:\n  \
-               --host <IP>                     Bind IP literal (default: 127.0.0.1)\n  \
-               -p, --port <PORT>               Bind TCP port (default: 4000)\n  \
-               -d, --storage-dir <DIR>         Persistent storage root (omit for ephemeral in-memory)\n  \
-               --base-url <URL>                Public canonical Pod base URL\n  \
-               --pod-prefix <URI>              Canonical PDP Pod URI prefix (default: wolin://pod)\n  \
-               --pod-cloud-domain <DOMAIN>     Multi-tenant subdomain root (default: wolin.cloud)\n  \
-               --oidc-issuer <URL>             Expected OIDC / ZITADEL token issuer\n  \
-               --oidc-audience <AUD>           Optional required OIDC token audience\n  \
-               --owner-webid <WEBID_OR_DID>    Bootstrap full WAC owner access on Pod root\n  \
-               --require-explicit-delegation   Require explicit DelegationGrant for AI agents\n  \
-               --max-body-bytes <BYTES>        Maximum HTTP request payload bytes (default: 16777216)\n  \
-               -h, --help                      Print help information\n  \
-               -V, --version                   Print version information",
+               --listen-addr <IP:PORT>            Bind socket address [env: WOLIN_LISTEN_ADDR] (default: 127.0.0.1:4000)\n  \
+               --host <IP>                        Bind IP literal [env: WOLIN_HOST] (default: 127.0.0.1)\n  \
+               -p, --port <PORT>                  Bind TCP port [env: WOLIN_PORT] (default: 4000)\n  \
+               -d, --storage-dir <DIR>            Persistent storage root [env: WOLIN_STORAGE_DIR] (use 'memory' for ephemeral)\n  \
+               --in-memory                        Force ephemeral in-memory storage (overrides WOLIN_STORAGE_DIR)\n  \
+               --base-url <URL>                   Public canonical Pod base URL [env: WOLIN_BASE_URL]\n  \
+               --pod-prefix <URI>                 Canonical PDP Pod URI prefix [env: WOLIN_POD_PREFIX] (default: wolin://pod)\n  \
+               --pod-cloud-domain <DOMAIN>        Multi-tenant subdomain root [env: WOLIN_POD_CLOUD_DOMAIN] (default: wolin.cloud)\n  \
+               --oidc-issuer <URL>                Expected OIDC / ZITADEL issuer [env: WOLIN_OIDC_ISSUER] (default: https://auth.wolin.id)\n  \
+               --oidc-audience <AUD>              Optional required OIDC audience [env: WOLIN_OIDC_AUDIENCE]\n  \
+               --owner-webid <WEBID_OR_DID>       Bootstrap WAC owner on Pod root [env: WOLIN_OWNER_WEBID]\n  \
+               --require-explicit-delegation      Require DelegationGrant for AI agents [env: WOLIN_REQUIRE_EXPLICIT_DELEGATION]\n  \
+               --no-require-explicit-delegation   Disable explicit DelegationGrant requirement\n  \
+               --mcp-enabled <BOOL>               Enable/disable Native MCP gateway [env: WOLIN_MCP_ENABLED] (default: true)\n  \
+               --no-mcp                           Shorthand for --mcp-enabled false\n  \
+               --max-body-bytes <BYTES>           Maximum HTTP payload bytes [env: WOLIN_MAX_BODY_BYTES] (default: 16777216)\n  \
+               --healthcheck                      Probe local /healthz endpoint and exit 0 if healthy\n  \
+               -h, --help                         Print help information\n  \
+               -V, --version                      Print version information",
             env!("CARGO_PKG_VERSION")
         )
     }
 
+    /// Parse process CLI arguments layered on top of `WOLIN_*` OS environment variables.
+    pub fn parse_from_os() -> Result<CliParseOutcome, String> {
+        Self::parse_from_with_env(std::env::args(), |k| std::env::var(k).ok())
+    }
+
+    /// Parse CLI arguments without reading OS environment variables (pure / deterministic).
     pub fn parse_from<I, S>(args: I) -> Result<CliParseOutcome, String>
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        let mut iter = args.into_iter().map(Into::into);
-        let _bin = iter.next();
-        let mut cfg = Self::default();
+        Self::parse_from_with_env(args, |_| None)
+    }
 
-        while let Some(arg) = iter.next() {
-            match arg.as_str() {
+    /// Parse CLI arguments layered over an injected `WOLIN_*` environment lookup
+    /// (`CLI flag > WOLIN_* env var > default`).
+    pub fn parse_from_with_env<I, S, F>(args: I, get_env: F) -> Result<CliParseOutcome, String>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+        F: Fn(&str) -> Option<String>,
+    {
+        let collected: Vec<String> = args.into_iter().map(Into::into).collect();
+        for raw_arg in collected.iter().skip(1) {
+            match raw_arg.as_str() {
                 "-h" | "--help" => return Ok(CliParseOutcome::Help(Self::usage())),
                 "-V" | "--version" => {
                     return Ok(CliParseOutcome::Version(format!(
@@ -410,80 +483,102 @@ impl ServerCliConfig {
                         env!("CARGO_PKG_VERSION")
                     )));
                 }
+                _ => {}
+            }
+        }
+
+        let mut cfg = Self::default();
+        cfg.apply_env(&get_env)?;
+
+        let mut healthcheck_mode = false;
+        let mut iter = collected.into_iter();
+        let _bin = iter.next();
+
+        while let Some(raw_arg) = iter.next() {
+            let (flag, inline_val) = if raw_arg.starts_with("--") {
+                match raw_arg.split_once('=') {
+                    Some((k, v)) => (k, Some(v.to_string())),
+                    None => (raw_arg.as_str(), None),
+                }
+            } else {
+                (raw_arg.as_str(), None)
+            };
+
+            match flag {
+                "--healthcheck" => {
+                    reject_inline_value(&inline_val, "--healthcheck")?;
+                    healthcheck_mode = true;
+                }
+                "--in-memory" => {
+                    reject_inline_value(&inline_val, "--in-memory")?;
+                    cfg.storage_dir = None;
+                }
                 "--require-explicit-delegation" => {
-                    cfg.require_explicit_delegation = true;
+                    cfg.require_explicit_delegation = match inline_val {
+                        Some(v) => parse_bool(&v, "--require-explicit-delegation")?,
+                        None => true,
+                    };
+                }
+                "--no-require-explicit-delegation" => {
+                    reject_inline_value(&inline_val, "--no-require-explicit-delegation")?;
+                    cfg.require_explicit_delegation = false;
+                }
+                "--mcp-enabled" => {
+                    let val = take_val(inline_val, &mut iter, "--mcp-enabled")?;
+                    cfg.mcp_enabled = parse_bool(&val, "--mcp-enabled")?;
+                }
+                "--no-mcp" => {
+                    reject_inline_value(&inline_val, "--no-mcp")?;
+                    cfg.mcp_enabled = false;
+                }
+                "--listen-addr" => {
+                    let val = take_val(inline_val, &mut iter, "--listen-addr")?;
+                    let addr = parse_listen_addr(&val, "--listen-addr")?;
+                    cfg.host = addr.ip();
+                    cfg.port = addr.port();
                 }
                 "--host" => {
-                    let val = next_val(&mut iter, "--host")?;
-                    cfg.host = val
-                        .parse::<IpAddr>()
-                        .map_err(|_| format!("Invalid IP literal for --host: '{val}'"))?;
+                    let val = take_val(inline_val, &mut iter, "--host")?;
+                    cfg.host = parse_host(&val, "--host")?;
                 }
                 "-p" | "--port" => {
-                    let val = next_val(&mut iter, "--port")?;
-                    cfg.port = val
-                        .parse::<u16>()
-                        .map_err(|_| format!("Invalid TCP port for --port: '{val}'"))?;
+                    let val = take_val(inline_val, &mut iter, "--port")?;
+                    cfg.port = parse_port(&val, "--port")?;
                 }
                 "-d" | "--storage-dir" => {
-                    let val = next_val(&mut iter, "--storage-dir")?;
-                    if val.trim().is_empty() {
-                        return Err("--storage-dir must not be empty".to_string());
-                    }
-                    cfg.storage_dir = Some(PathBuf::from(val));
+                    let val = take_val(inline_val, &mut iter, "--storage-dir")?;
+                    cfg.storage_dir = parse_storage_dir(&val, "--storage-dir")?;
                 }
                 "--base-url" => {
-                    let val = next_val(&mut iter, "--base-url")?;
-                    if !(val.starts_with("http://") || val.starts_with("https://")) {
-                        return Err("--base-url must start with http:// or https://".to_string());
-                    }
-                    cfg.base_url = Some(val.trim_end_matches('/').to_string());
+                    let val = take_val(inline_val, &mut iter, "--base-url")?;
+                    cfg.base_url = Some(parse_base_url(&val, "--base-url")?);
                 }
                 "--pod-prefix" => {
-                    let val = next_val(&mut iter, "--pod-prefix")?;
-                    if val.trim().is_empty() {
-                        return Err("--pod-prefix must not be empty".to_string());
-                    }
-                    cfg.pod_uri_prefix = val.trim_end_matches('/').to_string();
+                    let val = take_val(inline_val, &mut iter, "--pod-prefix")?;
+                    cfg.pod_uri_prefix = parse_pod_prefix(&val, "--pod-prefix")?;
                 }
                 "--pod-cloud-domain" => {
-                    let val = next_val(&mut iter, "--pod-cloud-domain")?;
-                    let clean = val.trim().trim_matches('.').to_ascii_lowercase();
-                    if clean.is_empty() {
-                        return Err("--pod-cloud-domain must not be empty".to_string());
-                    }
-                    cfg.pod_cloud_domain = clean;
+                    let val = take_val(inline_val, &mut iter, "--pod-cloud-domain")?;
+                    cfg.pod_cloud_domain = parse_cloud_domain(&val, "--pod-cloud-domain")?;
                 }
                 "--oidc-issuer" => {
-                    let val = next_val(&mut iter, "--oidc-issuer")?;
-                    if val.trim().is_empty() {
-                        return Err("--oidc-issuer must not be empty".to_string());
-                    }
-                    cfg.oidc_issuer = val;
+                    let val = take_val(inline_val, &mut iter, "--oidc-issuer")?;
+                    cfg.oidc_issuer = parse_oidc_issuer(&val, "--oidc-issuer")?;
                 }
                 "--oidc-audience" => {
-                    let val = next_val(&mut iter, "--oidc-audience")?;
+                    let val = take_val(inline_val, &mut iter, "--oidc-audience")?;
                     if val.trim().is_empty() {
                         return Err("--oidc-audience must not be empty".to_string());
                     }
-                    cfg.oidc_audience = Some(val);
+                    cfg.oidc_audience = Some(val.trim().to_string());
                 }
                 "--owner-webid" => {
-                    let val = next_val(&mut iter, "--owner-webid")?;
-                    if val.trim().is_empty() {
-                        return Err("--owner-webid must not be empty".to_string());
-                    }
-                    cfg.owner_webid = Some(val);
+                    let val = take_val(inline_val, &mut iter, "--owner-webid")?;
+                    cfg.owner_webid = Some(parse_owner_webid(&val, "--owner-webid")?);
                 }
                 "--max-body-bytes" => {
-                    let val = next_val(&mut iter, "--max-body-bytes")?;
-                    let parsed = val
-                        .parse::<usize>()
-                        .map_err(|_| format!("Invalid integer for --max-body-bytes: '{val}'"))?;
-                    if parsed == 0 {
-                        return Err("--max-body-bytes must be greater than 0".to_string());
-                    }
-                    cfg.max_body_bytes = parsed;
+                    let val = take_val(inline_val, &mut iter, "--max-body-bytes")?;
+                    cfg.max_body_bytes = parse_max_body_bytes(&val, "--max-body-bytes")?;
                 }
                 unknown => {
                     return Err(format!(
@@ -493,13 +588,234 @@ impl ServerCliConfig {
             }
         }
 
-        Ok(CliParseOutcome::Run(cfg))
+        if healthcheck_mode {
+            Ok(CliParseOutcome::Healthcheck(cfg))
+        } else {
+            Ok(CliParseOutcome::Run(cfg))
+        }
+    }
+
+    fn apply_env<F>(&mut self, get_env: &F) -> Result<(), String>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        if let Some(val) = non_empty_env(get_env, "WOLIN_LISTEN_ADDR") {
+            let addr = parse_listen_addr(&val, "WOLIN_LISTEN_ADDR")?;
+            self.host = addr.ip();
+            self.port = addr.port();
+        }
+        if let Some(val) = non_empty_env(get_env, "WOLIN_HOST") {
+            self.host = parse_host(&val, "WOLIN_HOST")?;
+        }
+        if let Some(val) = non_empty_env(get_env, "WOLIN_PORT") {
+            self.port = parse_port(&val, "WOLIN_PORT")?;
+        }
+        if let Some(val) = non_empty_env(get_env, "WOLIN_STORAGE_DIR") {
+            self.storage_dir = parse_storage_dir(&val, "WOLIN_STORAGE_DIR")?;
+        }
+        if let Some(val) = non_empty_env(get_env, "WOLIN_BASE_URL") {
+            self.base_url = Some(parse_base_url(&val, "WOLIN_BASE_URL")?);
+        }
+        if let Some(val) = non_empty_env(get_env, "WOLIN_POD_PREFIX") {
+            self.pod_uri_prefix = parse_pod_prefix(&val, "WOLIN_POD_PREFIX")?;
+        }
+        if let Some(val) = non_empty_env(get_env, "WOLIN_POD_CLOUD_DOMAIN") {
+            self.pod_cloud_domain = parse_cloud_domain(&val, "WOLIN_POD_CLOUD_DOMAIN")?;
+        }
+        if let Some(val) = non_empty_env(get_env, "WOLIN_OIDC_ISSUER") {
+            self.oidc_issuer = parse_oidc_issuer(&val, "WOLIN_OIDC_ISSUER")?;
+        }
+        if let Some(val) = non_empty_env(get_env, "WOLIN_OIDC_AUDIENCE") {
+            self.oidc_audience = Some(val);
+        }
+        if let Some(val) = non_empty_env(get_env, "WOLIN_OWNER_WEBID") {
+            self.owner_webid = Some(parse_owner_webid(&val, "WOLIN_OWNER_WEBID")?);
+        }
+        if let Some(val) = non_empty_env(get_env, "WOLIN_REQUIRE_EXPLICIT_DELEGATION") {
+            self.require_explicit_delegation =
+                parse_bool(&val, "WOLIN_REQUIRE_EXPLICIT_DELEGATION")?;
+        }
+        if let Some(val) = non_empty_env(get_env, "WOLIN_MCP_ENABLED") {
+            self.mcp_enabled = parse_bool(&val, "WOLIN_MCP_ENABLED")?;
+        }
+        if let Some(val) = non_empty_env(get_env, "WOLIN_MAX_BODY_BYTES") {
+            self.max_body_bytes = parse_max_body_bytes(&val, "WOLIN_MAX_BODY_BYTES")?;
+        }
+        Ok(())
     }
 }
 
-fn next_val<I: Iterator<Item = String>>(iter: &mut I, flag: &str) -> Result<String, String> {
-    iter.next()
-        .ok_or_else(|| format!("Missing value for CLI option '{flag}'"))
+fn non_empty_env<F>(get_env: &F, key: &str) -> Option<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    get_env(key).and_then(|v| {
+        let trimmed = v.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn take_val<I: Iterator<Item = String>>(
+    inline_val: Option<String>,
+    iter: &mut I,
+    flag: &str,
+) -> Result<String, String> {
+    match inline_val {
+        Some(v) => Ok(v),
+        None => match iter.next() {
+            Some(v) if !v.starts_with('-') => Ok(v),
+            Some(next_flag) => Err(format!(
+                "Missing value for CLI option '{flag}' (got flag '{next_flag}')"
+            )),
+            None => Err(format!("Missing value for CLI option '{flag}'")),
+        },
+    }
+}
+
+fn reject_inline_value(inline_val: &Option<String>, flag: &str) -> Result<(), String> {
+    if inline_val.is_some() {
+        Err(format!("Flag '{flag}' does not take a value"))
+    } else {
+        Ok(())
+    }
+}
+
+fn parse_listen_addr(val: &str, source: &str) -> Result<SocketAddr, String> {
+    val.trim().parse::<SocketAddr>().map_err(|_| {
+        format!("Invalid socket address (expected IP:PORT literal) for {source}: '{val}'")
+    })
+}
+
+fn parse_host(val: &str, source: &str) -> Result<IpAddr, String> {
+    val.trim()
+        .parse::<IpAddr>()
+        .map_err(|_| format!("Invalid IP literal for {source}: '{val}'"))
+}
+
+fn parse_port(val: &str, source: &str) -> Result<u16, String> {
+    val.trim()
+        .parse::<u16>()
+        .map_err(|_| format!("Invalid TCP port for {source}: '{val}'"))
+}
+
+fn parse_storage_dir(val: &str, source: &str) -> Result<Option<PathBuf>, String> {
+    let trimmed = val.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{source} must not be empty"));
+    }
+    if matches!(trimmed.to_ascii_lowercase().as_str(), "memory" | ":memory:") {
+        return Ok(None);
+    }
+    Ok(Some(PathBuf::from(trimmed)))
+}
+
+fn parse_base_url(val: &str, source: &str) -> Result<String, String> {
+    let validated =
+        pods::validate_http_uri(val.trim(), source).map_err(|e| format!("{source}: {e:?}"))?;
+    Ok(validated.trim_end_matches('/').to_string())
+}
+
+fn parse_oidc_issuer(val: &str, source: &str) -> Result<String, String> {
+    pods::validate_http_uri(val.trim(), source).map_err(|e| format!("{source}: {e:?}"))
+}
+
+fn parse_owner_webid(val: &str, source: &str) -> Result<String, String> {
+    pods::normalize_and_validate_owner_webid(val).map_err(|e| format!("{source}: {e:?}"))
+}
+
+fn parse_pod_prefix(val: &str, source: &str) -> Result<String, String> {
+    let clean = val.trim().trim_end_matches('/');
+    if clean.is_empty()
+        || clean
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+    {
+        return Err(format!(
+            "{source} must be a non-empty URI without whitespace"
+        ));
+    }
+    Ok(clean.to_string())
+}
+
+fn parse_cloud_domain(val: &str, source: &str) -> Result<String, String> {
+    let clean = val.trim().trim_matches('.').to_ascii_lowercase();
+    if clean.is_empty() || clean.len() > 253 {
+        return Err(format!("{source} must be a valid non-empty DNS domain"));
+    }
+    for label in clean.split('.') {
+        if label.is_empty()
+            || label.len() > 63
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        {
+            return Err(format!(
+                "Invalid DNS domain for {source}: '{val}' (expected bare domain like 'example.org')"
+            ));
+        }
+    }
+    Ok(clean)
+}
+
+fn parse_max_body_bytes(val: &str, source: &str) -> Result<usize, String> {
+    let parsed = val
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| format!("Invalid integer for {source}: '{val}'"))?;
+    if parsed == 0 {
+        return Err(format!("{source} must be greater than 0"));
+    }
+    Ok(parsed)
+}
+
+fn parse_bool(val: &str, source: &str) -> Result<bool, String> {
+    match val.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        _ => Err(format!(
+            "Invalid boolean for {source}: '{val}' (expected true/false/1/0)"
+        )),
+    }
+}
+
+/// Probe the configured local `/healthz` HTTP endpoint (used by `wolin-server --healthcheck`).
+pub async fn run_healthcheck_probe(cfg: &ServerCliConfig) -> Result<(), String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let addr = cfg.healthcheck_addr();
+    let probe = async {
+        let mut stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .map_err(|e| format!("Failed to connect to {addr}: {e}"))?;
+        let req = format!("GET /healthz HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+        stream
+            .write_all(req.as_bytes())
+            .await
+            .map_err(|e| format!("Failed to write healthcheck request: {e}"))?;
+        let mut buf = Vec::with_capacity(1024);
+        stream
+            .take(16 * 1024)
+            .read_to_end(&mut buf)
+            .await
+            .map_err(|e| format!("Failed to read healthcheck response: {e}"))?;
+        let text = String::from_utf8_lossy(&buf);
+        let status_ok = text.starts_with("HTTP/1.1 200 ") || text.starts_with("HTTP/1.0 200 ");
+        if status_ok && text.contains("\"healthy\"") {
+            Ok(())
+        } else {
+            Err(format!("Unhealthy response from {addr}/healthz"))
+        }
+    };
+
+    tokio::time::timeout(std::time::Duration::from_secs(4), probe)
+        .await
+        .map_err(|_| format!("Timed out probing {addr}/healthz"))?
 }
 
 /// Wait for OS termination signal (`SIGINT` / Ctrl+C or Unix `SIGTERM`) for clean Axum shutdown.
@@ -592,5 +908,410 @@ mod tests {
         assert!(ServerCliConfig::parse_from(["wolin-server", "--host", "localhost"]).is_err());
         assert!(ServerCliConfig::parse_from(["wolin-server", "--port", "99999"]).is_err());
         assert!(ServerCliConfig::parse_from(["wolin-server", "--unknown"]).is_err());
+    }
+
+    #[test]
+    fn unit_env_vars_populate_all_fields_when_cli_absent() {
+        use std::collections::HashMap;
+
+        let env_map = HashMap::from([
+            ("WOLIN_LISTEN_ADDR", "0.0.0.0:8443"),
+            ("WOLIN_STORAGE_DIR", "/data/wolin"),
+            ("WOLIN_BASE_URL", "https://pod.home.example/"),
+            ("WOLIN_POD_PREFIX", "wolin://home/"),
+            ("WOLIN_POD_CLOUD_DOMAIN", ".Home.Example."),
+            ("WOLIN_OIDC_ISSUER", "https://auth.home.example"),
+            ("WOLIN_OIDC_AUDIENCE", "wolin-home"),
+            ("WOLIN_OWNER_WEBID", "did:web:owner.home.example"),
+            ("WOLIN_REQUIRE_EXPLICIT_DELEGATION", "true"),
+            ("WOLIN_MCP_ENABLED", "false"),
+            ("WOLIN_MAX_BODY_BYTES", "4194304"),
+        ]);
+
+        let CliParseOutcome::Run(cfg) =
+            ServerCliConfig::parse_from_with_env(["wolin-server"], |k| {
+                env_map.get(k).map(|v| (*v).to_string())
+            })
+            .expect("env parse should succeed")
+        else {
+            panic!("expected Run");
+        };
+
+        assert_eq!(cfg.host, IpAddr::from([0, 0, 0, 0]));
+        assert_eq!(cfg.port, 8443);
+        assert_eq!(cfg.listen_addr(), "0.0.0.0:8443".parse().unwrap());
+        assert_eq!(cfg.storage_dir, Some(PathBuf::from("/data/wolin")));
+        assert_eq!(cfg.effective_base_url(), "https://pod.home.example");
+        assert_eq!(cfg.pod_uri_prefix, "wolin://home");
+        assert_eq!(cfg.pod_cloud_domain, "home.example");
+        assert_eq!(cfg.oidc_issuer, "https://auth.home.example");
+        assert_eq!(cfg.oidc_audience.as_deref(), Some("wolin-home"));
+        assert_eq!(
+            cfg.owner_webid.as_deref(),
+            Some("did:web:owner.home.example")
+        );
+        assert!(cfg.require_explicit_delegation);
+        assert!(!cfg.mcp_enabled);
+        assert_eq!(cfg.max_body_bytes, 4_194_304);
+    }
+
+    #[test]
+    fn unit_cli_flags_override_env_vars_and_empty_env_uses_defaults() {
+        use std::collections::HashMap;
+
+        let env_map = HashMap::from([
+            ("WOLIN_LISTEN_ADDR", "0.0.0.0:8080"),
+            ("WOLIN_STORAGE_DIR", "/env/data"),
+            ("WOLIN_BASE_URL", "https://env.example.org"),
+            ("WOLIN_POD_PREFIX", "wolin://env"),
+            ("WOLIN_POD_CLOUD_DOMAIN", "env.example.org"),
+            ("WOLIN_OIDC_ISSUER", "https://auth.env.example.org"),
+            ("WOLIN_OIDC_AUDIENCE", "env-aud"),
+            ("WOLIN_OWNER_WEBID", "did:web:env.example.org"),
+            ("WOLIN_REQUIRE_EXPLICIT_DELEGATION", "true"),
+            ("WOLIN_MCP_ENABLED", "false"),
+            ("WOLIN_MAX_BODY_BYTES", "2097152"),
+        ]);
+
+        let CliParseOutcome::Run(cfg) = ServerCliConfig::parse_from_with_env(
+            [
+                "wolin-server",
+                "--listen-addr",
+                "127.0.0.1:9000",
+                "--storage-dir",
+                "/cli/data",
+                "--base-url",
+                "https://cli.example.org/",
+                "--pod-prefix",
+                "wolin://cli/",
+                "--pod-cloud-domain",
+                "cli.example.org",
+                "--oidc-issuer",
+                "https://auth.cli.example.org",
+                "--oidc-audience",
+                "cli-aud",
+                "--owner-webid",
+                "did:web:cli.example.org",
+                "--no-require-explicit-delegation",
+                "--mcp-enabled",
+                "true",
+                "--max-body-bytes",
+                "8388608",
+            ],
+            |k| env_map.get(k).map(|v| (*v).to_string()),
+        )
+        .expect("CLI override parse should succeed") else {
+            panic!("expected Run");
+        };
+
+        assert_eq!(cfg.listen_addr(), "127.0.0.1:9000".parse().unwrap());
+        assert_eq!(cfg.storage_dir, Some(PathBuf::from("/cli/data")));
+        assert_eq!(cfg.effective_base_url(), "https://cli.example.org");
+        assert_eq!(cfg.pod_uri_prefix, "wolin://cli");
+        assert_eq!(cfg.pod_cloud_domain, "cli.example.org");
+        assert_eq!(cfg.oidc_issuer, "https://auth.cli.example.org");
+        assert_eq!(cfg.oidc_audience.as_deref(), Some("cli-aud"));
+        assert_eq!(cfg.owner_webid.as_deref(), Some("did:web:cli.example.org"));
+        assert!(!cfg.require_explicit_delegation);
+        assert!(cfg.mcp_enabled);
+        assert_eq!(cfg.max_body_bytes, 8_388_608);
+
+        // Partial CLI override: WOLIN_LISTEN_ADDR sets 0.0.0.0:8080, CLI -p 9090 overrides port only
+        let CliParseOutcome::Run(partial) =
+            ServerCliConfig::parse_from_with_env(["wolin-server", "-p", "9090", "--no-mcp"], |k| {
+                match k {
+                    "WOLIN_LISTEN_ADDR" => Some("0.0.0.0:8080".to_string()),
+                    "WOLIN_MCP_ENABLED" => Some("true".to_string()),
+                    _ => None,
+                }
+            })
+            .expect("partial CLI override")
+        else {
+            panic!("expected Run");
+        };
+        assert_eq!(partial.host, IpAddr::from([0, 0, 0, 0]));
+        assert_eq!(partial.port, 9090);
+        assert!(!partial.mcp_enabled);
+
+        // WOLIN_HOST + WOLIN_PORT + blank optional env vars (as in .env files)
+        let CliParseOutcome::Run(host_port_cfg) =
+            ServerCliConfig::parse_from_with_env(["wolin-server"], |k| match k {
+                "WOLIN_HOST" => Some("::1".to_string()),
+                "WOLIN_PORT" => Some("7070".to_string()),
+                "WOLIN_OWNER_WEBID" => Some("".to_string()),
+                "WOLIN_STORAGE_DIR" => Some("   ".to_string()),
+                "WOLIN_BASE_URL" => Some("".to_string()),
+                _ => None,
+            })
+            .expect("host/port + blank optional env parse")
+        else {
+            panic!("expected Run");
+        };
+        assert_eq!(host_port_cfg.listen_addr(), "[::1]:7070".parse().unwrap());
+        assert_eq!(host_port_cfg.effective_base_url(), "http://[::1]:7070");
+        assert!(host_port_cfg.storage_dir.is_none());
+        assert!(host_port_cfg.owner_webid.is_none());
+    }
+
+    #[test]
+    fn unit_invalid_env_vars_and_listen_addr_fail_closed() {
+        let bad_envs = [
+            ("WOLIN_LISTEN_ADDR", "localhost:4000"),
+            ("WOLIN_LISTEN_ADDR", "127.0.0.1"),
+            ("WOLIN_HOST", "localhost"),
+            ("WOLIN_PORT", "70000"),
+            ("WOLIN_BASE_URL", "ftp://bad.example"),
+            ("WOLIN_BASE_URL", "https://"),
+            ("WOLIN_BASE_URL", "https://pod.example.org?bad=1"),
+            ("WOLIN_OIDC_ISSUER", "not-a-url"),
+            ("WOLIN_OWNER_WEBID", "not-a-uri"),
+            ("WOLIN_POD_CLOUD_DOMAIN", "https://example.org"),
+            ("WOLIN_MCP_ENABLED", "maybe"),
+            ("WOLIN_REQUIRE_EXPLICIT_DELEGATION", "2"),
+            ("WOLIN_MAX_BODY_BYTES", "0"),
+            ("WOLIN_MAX_BODY_BYTES", "notanumber"),
+        ];
+
+        for (key, bad_val) in bad_envs {
+            let res = ServerCliConfig::parse_from_with_env(["wolin-server"], |k| {
+                (k == key).then(|| bad_val.to_string())
+            });
+            assert!(res.is_err(), "expected {key}={bad_val} to fail closed");
+        }
+
+        // Prevent missing option values from swallowing subsequent flags
+        assert!(
+            ServerCliConfig::parse_from(["wolin-server", "--owner-webid", "--no-mcp"]).is_err()
+        );
+        assert!(
+            ServerCliConfig::parse_from([
+                "wolin-server",
+                "--oidc-audience",
+                "--require-explicit-delegation",
+            ])
+            .is_err()
+        );
+        assert!(
+            ServerCliConfig::parse_from(["wolin-server", "--listen-addr", "localhost:4000"])
+                .is_err()
+        );
+
+        // DID canonicalization + WOLIN_STORAGE_DIR=memory + --in-memory + --healthcheck
+        let CliParseOutcome::Healthcheck(hc_cfg) = ServerCliConfig::parse_from_with_env(
+            ["wolin-server", "--in-memory", "--healthcheck"],
+            |k| match k {
+                "WOLIN_LISTEN_ADDR" => Some("0.0.0.0:4567".to_string()),
+                "WOLIN_STORAGE_DIR" => Some("/data".to_string()),
+                "WOLIN_OWNER_WEBID" => Some("did:web:Alice.Example.org".to_string()),
+                _ => None,
+            },
+        )
+        .expect("healthcheck + canonical DID parse") else {
+            panic!("expected Healthcheck");
+        };
+        assert!(hc_cfg.storage_dir.is_none());
+        assert_eq!(hc_cfg.healthcheck_addr(), "127.0.0.1:4567".parse().unwrap());
+        assert_eq!(
+            hc_cfg.owner_webid.as_deref(),
+            Some("did:web:alice.example.org")
+        );
+
+        let CliParseOutcome::Run(mem_env_cfg) =
+            ServerCliConfig::parse_from_with_env(["wolin-server"], |k| {
+                (k == "WOLIN_STORAGE_DIR").then(|| "memory".to_string())
+            })
+            .expect("WOLIN_STORAGE_DIR=memory parse")
+        else {
+            panic!("expected Run");
+        };
+        assert!(mem_env_cfg.storage_dir.is_none());
+
+        // --help and --version must succeed even if an environment variable is malformed
+        assert!(matches!(
+            ServerCliConfig::parse_from_with_env(["wolin-server", "--help"], |_| {
+                Some("invalid".to_string())
+            })
+            .expect("--help ignores bad env"),
+            CliParseOutcome::Help(_)
+        ));
+        assert!(matches!(
+            ServerCliConfig::parse_from_with_env(["wolin-server", "--version"], |_| {
+                Some("invalid".to_string())
+            })
+            .expect("--version ignores bad env"),
+            CliParseOutcome::Version(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn unit_healthz_endpoint_and_mcp_disabled_mode() {
+        use axum::{
+            body::{Body, to_bytes},
+            http::{Method, Request, StatusCode, header},
+        };
+        use tower::ServiceExt;
+
+        let cfg = LdpConfig::new("http://pod.wolin.local", "wolin://pod").with_mcp_enabled(false);
+        let state = AppState::new_in_memory(PolicyEngine::new(), cfg)
+            .await
+            .expect("init in-memory state");
+        let app = build_router(state);
+
+        // GET /healthz -> 200 OK
+        let hz = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hz.status(), StatusCode::OK);
+        let hz_json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(hz.into_body(), 65_536).await.unwrap()).unwrap();
+        assert_eq!(hz_json["status"], "healthy");
+
+        // DELETE /healthz -> 405 Method Not Allowed
+        let del_hz = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(del_hz.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+        // Percent-encoded /%68ealthz/probe must be rejected as reserved system path, not stored in LDP
+        let enc_hz = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/%68ealthz/probe")
+                    .header(header::CONTENT_TYPE, "text/turtle")
+                    .body(Body::from("<> <http://purl.org/dc/terms/title> \"bad\" ."))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(enc_hz.status(), StatusCode::BAD_REQUEST);
+
+        // GET /.well-known/wolin reflects disabled MCP and advertises /healthz
+        let wk = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/.well-known/wolin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wk.status(), StatusCode::OK);
+        let wk_json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(wk.into_body(), 65_536).await.unwrap()).unwrap();
+        assert_eq!(wk_json["endpoints"]["healthz"], "/healthz");
+        assert!(wk_json["endpoints"].get("mcp").is_none());
+        assert_eq!(wk_json["capabilities"]["mcp_jsonrpc"], false);
+        assert_eq!(wk_json["capabilities"]["mcp_sse"], false);
+        assert_eq!(wk_json["capabilities"]["mcp_tools"], json!([]));
+
+        // POST /mcp, GET /mcp, and GET /mcp/sse all return 404 Not Found when MCP is disabled
+        let mcp_post = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/mcp")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mcp_post.status(), StatusCode::NOT_FOUND);
+
+        let mcp_get = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/mcp")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mcp_get.status(), StatusCode::NOT_FOUND);
+
+        let mcp_sse = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/mcp/sse")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mcp_sse.status(), StatusCode::NOT_FOUND);
+
+        // Custom base_url host (e.g. wolin.example.org under pod_cloud_domain example.org)
+        // must NOT be misrouted as a tenant subdomain, and run_healthcheck_probe succeeds on TCP.
+        let custom_cfg = LdpConfig::new("https://wolin.example.org", "wolin://pod")
+            .with_pod_cloud_domain("example.org");
+        let custom_state = AppState::new_in_memory(PolicyEngine::new(), custom_cfg)
+            .await
+            .unwrap();
+        let custom_app = build_router(custom_state);
+
+        let create_pod = custom_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/pods")
+                    .header(header::HOST, "wolin.example.org")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"pod_id":"alice"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_pod.status(), StatusCode::CREATED);
+
+        let card = custom_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/pods/alice/profile/card")
+                    .header(header::HOST, "wolin.example.org")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(card.status(), StatusCode::OK);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bound_port = listener.local_addr().unwrap().port();
+        let srv = tokio::spawn(async move {
+            let _ = axum::serve(listener, custom_app).await;
+        });
+        let probe_cfg = ServerCliConfig {
+            host: IpAddr::from([0, 0, 0, 0]),
+            port: bound_port,
+            ..ServerCliConfig::default()
+        };
+        run_healthcheck_probe(&probe_cfg)
+            .await
+            .expect("live healthcheck probe should succeed");
+        srv.abort();
     }
 }

@@ -1,0 +1,52 @@
+# =============================================================================
+# Wolin (月印千江) Caddy Reverse Proxy Example
+# Usage:
+#   cp deploy/Caddyfile.example deploy/Caddyfile
+#   docker compose --env-file .env -f deploy/docker-compose.yml --profile caddy up -d
+# =============================================================================
+{
+	email {$ACME_EMAIL:admin@example.org}
+}
+
+# 1. Single-Domain Sovereign Pod Server (Automatic HTTP-01 / TLS-ALPN-01 ACME)
+{$WOLIN_PUBLIC_HOST:pod.example.org} {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=63072000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	# Disable response buffering for Native MCP Server-Sent Events (/mcp/sse)
+	@mcp_sse path /mcp/sse
+	handle @mcp_sse {
+		reverse_proxy {$WOLIN_UPSTREAM:wolin:4000} {
+			flush_interval -1
+		}
+	}
+
+	handle {
+		reverse_proxy {$WOLIN_UPSTREAM:wolin:4000}
+	}
+}
+
+# 2. Optional: Multi-Tenant Subdomain Pod Cloud (*.example.org -> {pod_id}.example.org)
+# Wildcard TLS certificates require a DNS-01 ACME build of Caddy (e.g. caddy-dns/cloudflare).
+#
+# *.{$WOLIN_POD_CLOUD_DOMAIN:example.org} {
+# 	tls {
+# 		dns cloudflare {env.CLOUDFLARE_API_TOKEN}
+# 	}
+# 	encode zstd gzip
+# 	header {
+# 		Strict-Transport-Security "max-age=63072000; includeSubDomains"
+# 		X-Content-Type-Options "nosniff"
+# 		Referrer-Policy "no-referrer"
+# 		-Server
+# 	}
+# 	reverse_proxy {$WOLIN_UPSTREAM:wolin:4000} {
+# 		flush_interval -1
+# 	}
+# }

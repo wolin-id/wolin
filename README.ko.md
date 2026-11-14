@@ -37,9 +37,11 @@ wolin/
 - **메모리 사용량**:
   - In-Memory 모드: **15.3 MiB RSS** (~5.9 ms 기동)
   - 영구 RocksDB + FS 모드: **21.4 MiB RSS** (대기) / **23.9 MiB RSS** (실부하)
-- **테스트 검증**: 워크스페이스 전체 **63/63** 테스트 통과 (`cargo test --locked --workspace`).
+- **테스트 검증**: 워크스페이스 전체 **67/67** 테스트 통과 (`cargo test --locked --workspace`).
 
 ## 3. 빠른 시작 (Quickstart)
+
+> Docker Compose, Caddy 자동 HTTPS, Cloudflare Tunnel, 라즈베리파이 / `systemd` 홈서버 구축 가이드는 **[docs/SELF_HOSTING.md](docs/SELF_HOSTING.md)**를 참고하세요.
 
 ```bash
 # 전체 워크스페이스 테스트 실행

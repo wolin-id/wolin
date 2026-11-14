@@ -44,6 +44,7 @@ const RESERVED_POD_IDS: &[&str] = &[
     "www",
     "mcp",
     "health",
+    "healthz",
     "public",
     "private",
     "admin",
@@ -164,6 +165,12 @@ pub fn extract_subdomain_pod(
     let host_lower = host_part.to_ascii_lowercase();
 
     if host_lower == cloud_domain {
+        return Ok(None);
+    }
+
+    if let Some(base_host) = extract_origin_host_lower(&config.base_url)
+        && host_lower == base_host
+    {
         return Ok(None);
     }
 
@@ -793,7 +800,17 @@ fn literal_triple(subj: &str, pred: &str, literal_value: &str) -> Result<Triple,
     ))
 }
 
-fn normalize_and_validate_owner_webid(raw: &str) -> Result<String, LdpError> {
+fn extract_origin_host_lower(origin: &str) -> Option<String> {
+    let rest = origin
+        .trim()
+        .strip_prefix("https://")
+        .or_else(|| origin.trim().strip_prefix("http://"))?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let (host, _) = split_host_and_port(authority).ok()?;
+    Some(host.to_ascii_lowercase())
+}
+
+pub(crate) fn normalize_and_validate_owner_webid(raw: &str) -> Result<String, LdpError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() || trimmed.len() > 2048 {
         return Err(LdpError::BadRequest(
@@ -808,7 +825,7 @@ fn normalize_and_validate_owner_webid(raw: &str) -> Result<String, LdpError> {
     validate_http_uri_allow_fragment(trimmed, "owner_webid")
 }
 
-fn validate_http_uri(raw: &str, field: &str) -> Result<String, LdpError> {
+pub(crate) fn validate_http_uri(raw: &str, field: &str) -> Result<String, LdpError> {
     if raw.contains('?') || raw.contains('#') {
         return Err(LdpError::BadRequest(format!(
             "{field} must not contain query or fragment components"

@@ -10,6 +10,14 @@ use wolin_mcp::protocol::{JsonRpcId, JsonRpcResponse, PARSE_ERROR};
 
 use crate::{AppState, auth::extract_principal_for_request, error::LdpError};
 
+/// Handler mounted on `/mcp` and `/mcp/sse` when `mcp_enabled == false` so all HTTP methods
+/// return `404 Not Found` cleanly without method fingerprinting or LDP fallback.
+pub async fn handle_mcp_disabled() -> Result<Response, LdpError> {
+    Err(LdpError::NotFound(
+        "Native MCP gateway is disabled on this server".to_string(),
+    ))
+}
+
 /// Handle Native MCP JSON-RPC 2.0 requests (`POST /mcp`) over Streamable HTTP.
 ///
 /// Enforces fail-closed OIDC/ZITADEL (`Bearer` / `DPoP`) and W3C `DID` authentication
@@ -18,6 +26,12 @@ pub async fn handle_mcp_post(
     State(state): State<Arc<AppState>>,
     req: Request,
 ) -> Result<Response, LdpError> {
+    if !state.config.mcp_enabled {
+        return Err(LdpError::NotFound(
+            "Native MCP gateway is disabled on this server".to_string(),
+        ));
+    }
+
     if req.uri().query().is_some() {
         return Err(LdpError::BadRequest(
             "Query parameters are not permitted on the /mcp endpoint".to_string(),
@@ -99,6 +113,12 @@ pub async fn handle_mcp_sse(
     State(state): State<Arc<AppState>>,
     req: Request,
 ) -> Result<Response, LdpError> {
+    if !state.config.mcp_enabled {
+        return Err(LdpError::NotFound(
+            "Native MCP gateway is disabled on this server".to_string(),
+        ));
+    }
+
     let method = req.method().clone();
     let uri = req.uri().clone();
     let headers = req.headers().clone();

@@ -1,18 +1,24 @@
-use std::net::SocketAddr;
-
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 use wolin_core::{ResourceUri, WebId};
 use wolin_identity::OidcValidationOptions;
 use wolin_policy::{AccessMode, PolicyEngine, SubjectMatcher, WacRule};
 use wolin_server::{
-    AppState, CliParseOutcome, LdpConfig, ServerCliConfig, build_router, shutdown_signal,
+    AppState, CliParseOutcome, LdpConfig, ServerCliConfig, build_router, run_healthcheck_probe,
+    shutdown_signal,
 };
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let cli_cfg = match ServerCliConfig::parse_from(std::env::args()) {
+    let cli_cfg = match ServerCliConfig::parse_from_os() {
         Ok(CliParseOutcome::Run(cfg)) => cfg,
+        Ok(CliParseOutcome::Healthcheck(cfg)) => {
+            if let Err(err) = run_healthcheck_probe(&cfg).await {
+                eprintln!("healthcheck failed: {err}");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
         Ok(CliParseOutcome::Help(help_text)) => {
             println!("{help_text}");
             return Ok(());
@@ -27,8 +33,21 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        EnvFilter::new("info,wolin_server=info,wolin_mcp=info,tower_http=info")
+    let log_directive = std::env::var("RUST_LOG")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            std::env::var("WOLIN_LOG")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| "info,wolin_server=info,wolin_mcp=info,tower_http=info".to_string());
+
+    let env_filter = EnvFilter::try_new(&log_directive).unwrap_or_else(|err| {
+        eprintln!("error: invalid log filter directive '{log_directive}': {err}");
+        std::process::exit(2);
     });
     tracing_subscriber::fmt()
         .with_env_filter(env_filter)
@@ -75,7 +94,8 @@ async fn main() -> anyhow::Result<()> {
     let ldp_config = LdpConfig::new(&base_url, &cli_cfg.pod_uri_prefix)
         .with_pod_cloud_domain(&cli_cfg.pod_cloud_domain)
         .with_oidc_options(oidc_opts)
-        .with_max_body_bytes(cli_cfg.max_body_bytes);
+        .with_max_body_bytes(cli_cfg.max_body_bytes)
+        .with_mcp_enabled(cli_cfg.mcp_enabled);
 
     let state = match &cli_cfg.storage_dir {
         Some(dir) => {
@@ -88,13 +108,14 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let bind_addr = SocketAddr::new(cli_cfg.host, cli_cfg.port);
+    let bind_addr = cli_cfg.listen_addr();
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     let local_addr = listener.local_addr()?;
 
     info!(
         listen_addr = %local_addr,
         base_url = %base_url,
+        mcp_enabled = cli_cfg.mcp_enabled,
         "Wolin Server ready (Solid LDP + WAC/ACP + Native MCP)"
     );
 
