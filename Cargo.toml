@@ -29,7 +29,7 @@ wolin-mcp = { path = "crates/wolin-mcp" }
 tokio = { version = "1.41", features = ["full"] }
 axum = { version = "0.8", features = ["macros"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.7", features = ["cors", "trace"] }
 
 # Serialization & Utils
 serde = { version = "1.0", features = ["derive"] }
