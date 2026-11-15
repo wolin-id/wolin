@@ -25,7 +25,10 @@ use wolin_identity::{
 };
 use wolin_mcp::{DisclosurePolicy, McpAgentServer, McpGatewayConfig};
 use wolin_policy::PolicyEngine;
-use wolin_storage::{PhysicalStore, SemanticGraphStore};
+pub use wolin_storage::{
+    DEFAULT_MAX_OPEN_PODS, DEFAULT_POD_QUOTA_BYTES, PhysicalStore, PodStoreManager,
+    SemanticGraphStore,
+};
 
 const DEFAULT_MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 
@@ -50,6 +53,10 @@ pub struct LdpConfig {
     pub webid_dereferencer: Option<Arc<dyn WebIdDereferencer>>,
     /// Whether the Native MCP HTTP/SSE gateway (`/mcp`, `/mcp/sse`) is enabled.
     pub mcp_enabled: bool,
+    /// Maximum number of concurrently open per-pod RocksDB graph stores in the LRU cache.
+    pub max_open_pods: usize,
+    /// Default logical storage quota in bytes per tenant Pod (`1 GiB` default).
+    pub default_pod_quota_bytes: u64,
 }
 
 impl Default for LdpConfig {
@@ -67,6 +74,8 @@ impl Default for LdpConfig {
             pod_cloud_domain: "wolin.cloud".to_string(),
             webid_dereferencer: default_deref,
             mcp_enabled: true,
+            max_open_pods: DEFAULT_MAX_OPEN_PODS,
+            default_pod_quota_bytes: DEFAULT_POD_QUOTA_BYTES,
         }
     }
 }
@@ -119,12 +128,23 @@ impl LdpConfig {
         self.mcp_enabled = enabled;
         self
     }
+
+    pub fn with_max_open_pods(mut self, max_open_pods: usize) -> Self {
+        self.max_open_pods = max_open_pods;
+        self
+    }
+
+    pub fn with_pod_quota_bytes(mut self, quota_bytes: u64) -> Self {
+        self.default_pod_quota_bytes = quota_bytes;
+        self
+    }
 }
 
 /// Shared application state across Axum Solid LDP, Native MCP, and system discovery endpoints.
 pub struct AppState {
     pub physical_store: PhysicalStore,
     pub graph_store: SemanticGraphStore,
+    pub pod_stores: PodStoreManager,
     pub policy_engine: Arc<RwLock<PolicyEngine>>,
     pub disclosure_policy: Arc<RwLock<DisclosurePolicy>>,
     pub catalog_lock: Arc<tokio::sync::RwLock<()>>,
@@ -140,11 +160,36 @@ impl AppState {
     pub async fn new(
         physical_store: PhysicalStore,
         graph_store: SemanticGraphStore,
+        policy_engine: PolicyEngine,
+        config: LdpConfig,
+    ) -> wolin_core::Result<Arc<Self>> {
+        let pod_stores = PodStoreManager::from_stores(
+            &physical_store,
+            graph_store.clone(),
+            config.max_open_pods,
+            config.default_pod_quota_bytes,
+        )?;
+        Self::new_with_pod_stores(
+            physical_store,
+            graph_store,
+            pod_stores,
+            policy_engine,
+            config,
+        )
+        .await
+    }
+
+    /// Construct [`AppState`] with an explicit [`PodStoreManager`].
+    pub async fn new_with_pod_stores(
+        physical_store: PhysicalStore,
+        graph_store: SemanticGraphStore,
+        pod_stores: PodStoreManager,
         mut policy_engine: PolicyEngine,
         config: LdpConfig,
     ) -> wolin_core::Result<Arc<Self>> {
         let catalog = LdpCatalog::load_or_init(&physical_store).await?;
-        ldp::rehydrate_persisted_acl_rules(&graph_store, &catalog, &mut policy_engine, &config)?;
+        pod_stores.replace_all_pod_usages(catalog.all_pod_usages());
+        ldp::rehydrate_persisted_acl_rules(&pod_stores, &catalog, &mut policy_engine, &config)?;
 
         let policy_arc = Arc::new(RwLock::new(policy_engine));
         let disclosure_arc = Arc::new(RwLock::new(DisclosurePolicy::new()));
@@ -156,9 +201,10 @@ impl AppState {
             mcp_config = mcp_config.with_policy_clock(ts);
         }
 
-        let mcp_server = McpAgentServer::with_shared_state(
+        let mcp_server = McpAgentServer::with_shared_pod_stores(
             physical_store.clone(),
             graph_store.clone(),
+            pod_stores.clone(),
             Arc::clone(&policy_arc),
             Arc::clone(&disclosure_arc),
             Arc::clone(&catalog_lock),
@@ -168,6 +214,7 @@ impl AppState {
         Ok(Arc::new(Self {
             physical_store,
             graph_store,
+            pod_stores,
             policy_engine: policy_arc,
             disclosure_policy: disclosure_arc,
             catalog_lock,
@@ -188,7 +235,8 @@ impl AppState {
         Self::new(physical_store, graph_store, policy_engine, config).await
     }
 
-    /// Create a disk-backed persistent [`AppState`] rooted at `storage_dir` (`blobs/` + `graph/`).
+    /// Create a disk-backed persistent [`AppState`] rooted at `storage_dir`
+    /// (`blobs/`, system `graph/`, and per-pod `pods/{pod_id}/graph/`).
     pub async fn new_persistent(
         storage_dir: impl AsRef<Path>,
         policy_engine: PolicyEngine,
@@ -197,9 +245,11 @@ impl AppState {
         let root = storage_dir.as_ref();
         let blobs_dir = root.join("blobs");
         let graph_dir = root.join("graph");
+        let pods_dir = root.join("pods");
         ensure_private_dir(root)?;
         ensure_private_dir(&blobs_dir)?;
         ensure_private_dir(&graph_dir)?;
+        ensure_private_dir(&pods_dir)?;
 
         let blobs_str = blobs_dir.to_str().ok_or_else(|| {
             wolin_core::WolinError::InvalidFormat(
@@ -207,8 +257,21 @@ impl AppState {
             )
         })?;
         let physical_store = PhysicalStore::new_fs(blobs_str)?;
-        let graph_store = SemanticGraphStore::open(&graph_dir)?;
-        Self::new(physical_store, graph_store, policy_engine, config).await
+        let graph_store = SemanticGraphStore::open_bounded(&graph_dir, 64)?;
+        let pod_stores = PodStoreManager::new_persistent_with_system_store(
+            root,
+            graph_store.clone(),
+            config.max_open_pods,
+            config.default_pod_quota_bytes,
+        )?;
+        Self::new_with_pod_stores(
+            physical_store,
+            graph_store,
+            pod_stores,
+            policy_engine,
+            config,
+        )
+        .await
     }
 
     /// Mutate the live [`PolicyEngine`] safely under write lock (shared by LDP and MCP).
@@ -233,6 +296,8 @@ impl AppState {
     pub async fn sync_catalog_from_store(&self) -> Result<(), error::LdpError> {
         let _read_guard = self.catalog_lock.read().await;
         let fresh = LdpCatalog::load_or_init(&self.physical_store).await?;
+        self.pod_stores
+            .replace_all_pod_usages(fresh.all_pod_usages());
         let mut cat_guard = self.catalog.write().await;
         *cat_guard = fresh;
         Ok(())
@@ -340,6 +405,9 @@ pub async fn well_known_wolin(State(state): State<Arc<AppState>>) -> Json<serde_
             "solid_ldp": true,
             "solid_oidc_dpop": true,
             "multi_tenant_pod_cloud": true,
+            "per_pod_physical_isolation": true,
+            "bounded_pod_lru_cache": true,
+            "per_pod_storage_quota": true,
             "wac_acp_pdp": true,
             "mcp_jsonrpc": mcp_enabled,
             "mcp_sse": mcp_enabled,
@@ -364,6 +432,8 @@ pub struct ServerCliConfig {
     pub require_explicit_delegation: bool,
     pub mcp_enabled: bool,
     pub max_body_bytes: usize,
+    pub max_open_pods: usize,
+    pub pod_quota_bytes: u64,
 }
 
 impl Default for ServerCliConfig {
@@ -381,6 +451,8 @@ impl Default for ServerCliConfig {
             require_explicit_delegation: false,
             mcp_enabled: true,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            max_open_pods: DEFAULT_MAX_OPEN_PODS,
+            pod_quota_bytes: DEFAULT_POD_QUOTA_BYTES,
         }
     }
 }
@@ -444,6 +516,8 @@ impl ServerCliConfig {
                --mcp-enabled <BOOL>               Enable/disable Native MCP gateway [env: WOLIN_MCP_ENABLED] (default: true)\n  \
                --no-mcp                           Shorthand for --mcp-enabled false\n  \
                --max-body-bytes <BYTES>           Maximum HTTP payload bytes [env: WOLIN_MAX_BODY_BYTES] (default: 16777216)\n  \
+               --max-open-pods <COUNT>            Max open per-pod RocksDB stores [env: WOLIN_MAX_OPEN_PODS] (default: 256)\n  \
+               --pod-quota-bytes <BYTES>          Default per-pod storage quota in bytes [env: WOLIN_DEFAULT_POD_QUOTA_BYTES] (default: 1073741824)\n  \
                --healthcheck                      Probe local /healthz endpoint and exit 0 if healthy\n  \
                -h, --help                         Print help information\n  \
                -V, --version                      Print version information",
@@ -580,6 +654,14 @@ impl ServerCliConfig {
                     let val = take_val(inline_val, &mut iter, "--max-body-bytes")?;
                     cfg.max_body_bytes = parse_max_body_bytes(&val, "--max-body-bytes")?;
                 }
+                "--max-open-pods" => {
+                    let val = take_val(inline_val, &mut iter, "--max-open-pods")?;
+                    cfg.max_open_pods = parse_max_open_pods(&val, "--max-open-pods")?;
+                }
+                "--pod-quota-bytes" => {
+                    let val = take_val(inline_val, &mut iter, "--pod-quota-bytes")?;
+                    cfg.pod_quota_bytes = parse_pod_quota_bytes(&val, "--pod-quota-bytes")?;
+                }
                 unknown => {
                     return Err(format!(
                         "Unknown CLI flag '{unknown}'. Run with --help for usage."
@@ -640,6 +722,12 @@ impl ServerCliConfig {
         }
         if let Some(val) = non_empty_env(get_env, "WOLIN_MAX_BODY_BYTES") {
             self.max_body_bytes = parse_max_body_bytes(&val, "WOLIN_MAX_BODY_BYTES")?;
+        }
+        if let Some(val) = non_empty_env(get_env, "WOLIN_MAX_OPEN_PODS") {
+            self.max_open_pods = parse_max_open_pods(&val, "WOLIN_MAX_OPEN_PODS")?;
+        }
+        if let Some(val) = non_empty_env(get_env, "WOLIN_DEFAULT_POD_QUOTA_BYTES") {
+            self.pod_quota_bytes = parse_pod_quota_bytes(&val, "WOLIN_DEFAULT_POD_QUOTA_BYTES")?;
         }
         Ok(())
     }
@@ -767,6 +855,28 @@ fn parse_max_body_bytes(val: &str, source: &str) -> Result<usize, String> {
     let parsed = val
         .trim()
         .parse::<usize>()
+        .map_err(|_| format!("Invalid integer for {source}: '{val}'"))?;
+    if parsed == 0 {
+        return Err(format!("{source} must be greater than 0"));
+    }
+    Ok(parsed)
+}
+
+fn parse_max_open_pods(val: &str, source: &str) -> Result<usize, String> {
+    let parsed = val
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| format!("Invalid integer for {source}: '{val}'"))?;
+    if parsed == 0 {
+        return Err(format!("{source} must be greater than 0"));
+    }
+    Ok(parsed)
+}
+
+fn parse_pod_quota_bytes(val: &str, source: &str) -> Result<u64, String> {
+    let parsed = val
+        .trim()
+        .parse::<u64>()
         .map_err(|_| format!("Invalid integer for {source}: '{val}'"))?;
     if parsed == 0 {
         return Err(format!("{source} must be greater than 0"));
@@ -1313,5 +1423,65 @@ mod tests {
             .await
             .expect("live healthcheck probe should succeed");
         srv.abort();
+    }
+
+    #[test]
+    fn unit_pod_lru_and_quota_cli_and_env_parsing() {
+        let CliParseOutcome::Run(defaults) =
+            ServerCliConfig::parse_from(["wolin-server"]).expect("default parse")
+        else {
+            panic!("expected Run");
+        };
+        assert_eq!(defaults.max_open_pods, 256);
+        assert_eq!(defaults.pod_quota_bytes, 1_073_741_824);
+
+        let CliParseOutcome::Run(from_env) =
+            ServerCliConfig::parse_from_with_env(["wolin-server"], |k| match k {
+                "WOLIN_MAX_OPEN_PODS" => Some("64".to_string()),
+                "WOLIN_DEFAULT_POD_QUOTA_BYTES" => Some("536870912".to_string()),
+                _ => None,
+            })
+            .expect("env parse")
+        else {
+            panic!("expected Run");
+        };
+        assert_eq!(from_env.max_open_pods, 64);
+        assert_eq!(from_env.pod_quota_bytes, 536_870_912);
+
+        let CliParseOutcome::Run(cli_override) = ServerCliConfig::parse_from_with_env(
+            [
+                "wolin-server",
+                "--max-open-pods",
+                "16",
+                "--pod-quota-bytes=10485760",
+            ],
+            |k| match k {
+                "WOLIN_MAX_OPEN_PODS" => Some("64".to_string()),
+                "WOLIN_DEFAULT_POD_QUOTA_BYTES" => Some("536870912".to_string()),
+                _ => None,
+            },
+        )
+        .expect("CLI override") else {
+            panic!("expected Run");
+        };
+        assert_eq!(cli_override.max_open_pods, 16);
+        assert_eq!(cli_override.pod_quota_bytes, 10_485_760);
+
+        for (bad_env, bad_val) in [
+            ("WOLIN_MAX_OPEN_PODS", "0"),
+            ("WOLIN_MAX_OPEN_PODS", "abc"),
+            ("WOLIN_DEFAULT_POD_QUOTA_BYTES", "0"),
+            ("WOLIN_DEFAULT_POD_QUOTA_BYTES", "-5"),
+        ] {
+            assert!(
+                ServerCliConfig::parse_from_with_env(["wolin-server"], |k| {
+                    (k == bad_env).then(|| bad_val.to_string())
+                })
+                .is_err(),
+                "expected {bad_env}={bad_val} to fail closed"
+            );
+        }
+        assert!(ServerCliConfig::parse_from(["wolin-server", "--max-open-pods", "0"]).is_err());
+        assert!(ServerCliConfig::parse_from(["wolin-server", "--pod-quota-bytes", "0"]).is_err());
     }
 }

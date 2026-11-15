@@ -21,6 +21,7 @@ pub enum LdpError {
     PreconditionFailed(String),
     PayloadTooLarge(String),
     UnsupportedMediaType(String),
+    InsufficientStorage(String),
     Internal(String),
 }
 
@@ -31,6 +32,7 @@ impl From<WolinError> for LdpError {
             WolinError::Unauthorized(msg) => Self::Forbidden(msg),
             WolinError::NotFound(msg) => Self::NotFound(msg),
             WolinError::InvalidFormat(msg) => Self::BadRequest(msg),
+            WolinError::QuotaExceeded(msg) => Self::InsufficientStorage(msg),
             WolinError::Storage(msg) | WolinError::Semantic(msg) | WolinError::Internal(msg) => {
                 Self::Internal(msg)
             }
@@ -83,6 +85,13 @@ impl IntoResponse for LdpError {
             Self::UnsupportedMediaType(msg) => (
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
                 "unsupported_media_type",
+                msg,
+                None,
+                None,
+            ),
+            Self::InsufficientStorage(msg) => (
+                StatusCode::INSUFFICIENT_STORAGE,
+                "insufficient_storage",
                 msg,
                 None,
                 None,

@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use oxigraph::io::{RdfFormat, RdfParser, RdfSerializer};
 use oxigraph::model::{
@@ -7,7 +7,7 @@ use oxigraph::model::{
     Term, Triple,
 };
 use oxigraph::sparql::{QueryResults, SparqlEvaluator};
-use oxigraph::store::Store;
+use oxigraph::store::{Store, StoreOptions};
 use serde::{Deserialize, Serialize};
 use wolin_core::{Result, WolinError};
 
@@ -292,6 +292,7 @@ pub enum SparqlQueryOutput {
 #[derive(Clone)]
 pub struct SemanticGraphStore {
     store: Store,
+    storage_dir: Option<PathBuf>,
 }
 
 impl SemanticGraphStore {
@@ -299,14 +300,60 @@ impl SemanticGraphStore {
     pub fn new_in_memory() -> Result<Self> {
         let store =
             Store::new().map_err(|e| WolinError::Semantic(format!("Oxigraph init failed: {e}")))?;
-        Ok(Self { store })
+        Ok(Self {
+            store,
+            storage_dir: None,
+        })
     }
 
     /// Open or create a persistent RocksDB-backed RDF store on disk.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let store = Store::open(path)
+        let dir = path.as_ref().to_path_buf();
+        let store = Store::open(&dir)
             .map_err(|e| WolinError::Semantic(format!("Oxigraph open failed: {e}")))?;
-        Ok(Self { store })
+        Ok(Self {
+            store,
+            storage_dir: Some(dir),
+        })
+    }
+
+    /// Open or create a persistent RocksDB-backed RDF store with a bounded file descriptor budget.
+    pub fn open_bounded(path: impl AsRef<Path>, max_open_files: u32) -> Result<Self> {
+        let dir = path.as_ref().to_path_buf();
+        let opts = StoreOptions::default().with_max_open_files(max_open_files.max(16));
+        let store = Store::open_with_options(&dir, opts)
+            .map_err(|e| WolinError::Semantic(format!("Oxigraph open failed: {e}")))?;
+        Ok(Self {
+            store,
+            storage_dir: Some(dir),
+        })
+    }
+
+    /// Return the underlying RocksDB directory when backed by persistent disk storage.
+    pub fn storage_dir(&self) -> Option<&Path> {
+        self.storage_dir.as_deref()
+    }
+
+    /// Flush buffered writes to disk (no-op for in-memory stores).
+    pub fn flush(&self) -> Result<()> {
+        self.store
+            .flush()
+            .map_err(|e| WolinError::Semantic(format!("Oxigraph flush failed: {e}")))
+    }
+
+    /// Serialize all quads across the default and named graphs into canonical N-Quads bytes.
+    pub fn dump_nquads(&self) -> Result<Vec<u8>> {
+        let mut serializer = RdfSerializer::from_format(RdfFormat::NQuads).for_writer(Vec::new());
+        for quad_res in self.store.iter() {
+            let quad = quad_res
+                .map_err(|e| WolinError::Semantic(format!("Oxigraph quad dump failed: {e}")))?;
+            serializer
+                .serialize_quad(&quad)
+                .map_err(|e| WolinError::Semantic(format!("N-Quads serialize failed: {e}")))?;
+        }
+        serializer
+            .finish()
+            .map_err(|e| WolinError::Semantic(format!("N-Quads finalize failed: {e}")))
     }
 
     /// Access the underlying Oxigraph [`Store`].

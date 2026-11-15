@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 use opendal::{
     ErrorKind, Operator,
     services::{Fs, Memory},
@@ -18,6 +20,7 @@ pub struct BlobMetadata {
 #[derive(Clone)]
 pub struct PhysicalStore {
     operator: Operator,
+    fs_root: Option<PathBuf>,
 }
 
 impl PhysicalStore {
@@ -26,7 +29,10 @@ impl PhysicalStore {
         let builder = Fs::default().root(root);
         let op = Operator::new(builder)
             .map_err(|e| WolinError::Storage(format!("OpenDAL fs init failed: {e}")))?;
-        Ok(Self { operator: op })
+        Ok(Self {
+            operator: op,
+            fs_root: Some(PathBuf::from(root)),
+        })
     }
 
     /// Initialize an isolated in-memory blob store (for ephemeral pods and tests).
@@ -34,12 +40,23 @@ impl PhysicalStore {
         let builder = Memory::default();
         let op = Operator::new(builder)
             .map_err(|e| WolinError::Storage(format!("OpenDAL memory init failed: {e}")))?;
-        Ok(Self { operator: op })
+        Ok(Self {
+            operator: op,
+            fs_root: None,
+        })
     }
 
     /// Wrap an existing configured OpenDAL [`Operator`].
     pub fn from_operator(operator: Operator) -> Self {
-        Self { operator }
+        Self {
+            operator,
+            fs_root: None,
+        }
+    }
+
+    /// Return the local filesystem root directory when initialized via [`Self::new_fs`].
+    pub fn fs_root(&self) -> Option<&Path> {
+        self.fs_root.as_deref()
     }
 
     /// Access the underlying OpenDAL [`Operator`].

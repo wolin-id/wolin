@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use wolin_core::{ResourceKind, ResourceUri, Result, WolinError};
-use wolin_storage::PhysicalStore;
+use wolin_storage::{PhysicalStore, PodStoreManager};
 
 pub const CATALOG_META_KEY: &str = "__wolin_meta/catalog.json";
 const RESERVED_META_SEG: &str = "__wolin_meta";
@@ -15,6 +15,8 @@ pub struct CatalogEntry {
     pub kind: ResourceKind,
     pub content_type: String,
     pub etag: String,
+    #[serde(default)]
+    pub size_bytes: u64,
 }
 
 /// Persistent Solid Pod catalog stored at `__wolin_meta/catalog.json`.
@@ -33,6 +35,7 @@ impl Default for PodCatalog {
                 kind: ResourceKind::Container,
                 content_type: "text/turtle".to_string(),
                 etag: compute_etag(b"root-container-v0"),
+                size_bytes: 0,
             },
         );
         Self { entries }
@@ -45,6 +48,14 @@ impl PodCatalog {
             let bytes = physical_store.get(CATALOG_META_KEY).await?;
             let mut catalog: Self = serde_json::from_slice(&bytes)
                 .map_err(|e| WolinError::Storage(format!("Corrupt Pod catalog metadata: {e}")))?;
+            for entry in catalog.entries.values_mut() {
+                if entry.size_bytes == 0
+                    && entry.kind != ResourceKind::Container
+                    && let Some(inferred) = infer_size_from_wolin_etag(&entry.etag)
+                {
+                    entry.size_bytes = inferred;
+                }
+            }
             catalog
                 .entries
                 .entry("/".to_string())
@@ -53,6 +64,7 @@ impl PodCatalog {
                     kind: ResourceKind::Container,
                     content_type: "text/turtle".to_string(),
                     etag: compute_etag(b"root-container-v0"),
+                    size_bytes: 0,
                 });
             Ok(catalog)
         } else {
@@ -67,6 +79,27 @@ impl PodCatalog {
             .put_with_content_type(CATALOG_META_KEY, bytes, "application/json")
             .await
     }
+
+    pub fn pod_usage_bytes(&self, pod_id: &str) -> u64 {
+        self.entries
+            .values()
+            .filter(|entry| {
+                PodStoreManager::pod_id_from_canonical_path(&entry.path)
+                    .ok()
+                    .flatten()
+                    == Some(pod_id)
+            })
+            .fold(0u64, |acc, entry| acc.saturating_add(entry.size_bytes))
+    }
+}
+
+fn infer_size_from_wolin_etag(etag: &str) -> Option<u64> {
+    let inner = etag.strip_prefix('"')?.strip_suffix('"')?;
+    let (hash_hex, len_hex) = inner.split_once('-')?;
+    if hash_hex.len() != 32 || !hash_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u64::from_str_radix(len_hex, 16).ok()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -242,6 +275,7 @@ fn canonicalize_ldp_path(raw_path: &str) -> Result<(String, bool, bool)> {
         canonical.push('/');
     }
 
+    let _ = PodStoreManager::pod_id_from_canonical_path(&canonical)?;
     let is_acl = canonical.ends_with(".acl");
     Ok((canonical, is_container, is_acl))
 }

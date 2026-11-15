@@ -33,6 +33,8 @@ CLI flag  >  WOLIN_* environment variable  >  built-in default
 | `WOLIN_REQUIRE_EXPLICIT_DELEGATION` | `--require-explicit-delegation` | `false` | Require explicit `DelegationGrant` for delegated AI agents (`act.sub`) |
 | `WOLIN_MCP_ENABLED` | `--mcp-enabled <BOOL>` / `--no-mcp` | `true` | Enable or disable Native MCP JSON-RPC (`/mcp`) and SSE (`/mcp/sse`) |
 | `WOLIN_MAX_BODY_BYTES` | `--max-body-bytes <BYTES>` | `16777216` | Maximum accepted HTTP payload size in bytes (16 MiB) |
+| `WOLIN_MAX_OPEN_PODS` | `--max-open-pods <COUNT>` | `256` | Max open per-Pod RocksDB stores in the bounded LRU cache |
+| `WOLIN_DEFAULT_POD_QUOTA_BYTES` | `--pod-quota-bytes <BYTES>` | `1073741824` | Default per-Pod storage quota in bytes (`1 GiB`) |
 | `WOLIN_LOG` / `RUST_LOG` | *(env only)* | `info,...` | Structured `tracing` log filter |
 
 ### 1.2 Quickstart A: Docker Compose (Recommended)
@@ -193,6 +195,8 @@ CLI 플래그  >  WOLIN_* 환경변수  >  내장 기본값
 | `WOLIN_REQUIRE_EXPLICIT_DELEGATION` | `--require-explicit-delegation` | `false` | AI 에이전트(`act.sub`) 요청 시 명시적 `DelegationGrant` 요구 여부 |
 | `WOLIN_MCP_ENABLED` | `--mcp-enabled <BOOL>` / `--no-mcp` | `true` | Native MCP 게이트웨이(`/mcp`, `/mcp/sse`) 활성화 여부 |
 | `WOLIN_MAX_BODY_BYTES` | `--max-body-bytes <BYTES>` | `16777216` | 최대 허용 HTTP 요청 본문 크기 (기본 16 MiB) |
+| `WOLIN_MAX_OPEN_PODS` | `--max-open-pods <COUNT>` | `256` | 동시 오픈 허용 Pod별 RocksDB 그래프 스토어 LRU 상한 |
+| `WOLIN_DEFAULT_POD_QUOTA_BYTES` | `--pod-quota-bytes <BYTES>` | `1073741824` | Pod당 기본 스토리지 쿼터 바이트 (`1 GiB`) |
 | `WOLIN_LOG` / `RUST_LOG` | *(환경변수 전용)* | `info,...` | 구조화 로그 레벨 필터 |
 
 ### 2.2 빠른 시작 A: Docker Compose (권장)

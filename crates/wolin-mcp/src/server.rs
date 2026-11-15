@@ -6,8 +6,8 @@ use tracing::{info, warn};
 use wolin_core::{Principal, ResourceKind, ResourceUri, Result};
 use wolin_policy::{AccessDecision, AccessMode, PolicyEngine};
 use wolin_storage::{
-    ConstructGraph, PhysicalStore, RdfTerm, RdfTriple, SemanticGraphStore, SparqlBindingRow,
-    SparqlBindingSet,
+    ConstructGraph, DEFAULT_MAX_OPEN_PODS, DEFAULT_POD_QUOTA_BYTES, PhysicalStore, PodStoreManager,
+    RdfTerm, RdfTriple, SemanticGraphStore, SparqlBindingRow, SparqlBindingSet,
     rdf_io::{JsonLdProfileSet, RdfFormat},
     rdf_model::{GraphName, GraphNameRef, NamedNode, NamedOrBlankNode, Quad, Term, Triple},
     rdf_sparql::{PreparedSparqlQuery, QueryResults, SparqlEvaluator},
@@ -110,6 +110,7 @@ impl McpGatewayConfig {
 pub struct McpAgentServer {
     physical_store: PhysicalStore,
     graph_store: SemanticGraphStore,
+    pod_stores: PodStoreManager,
     policy_engine: Arc<RwLock<PolicyEngine>>,
     disclosure_policy: Arc<RwLock<DisclosurePolicy>>,
     catalog_lock: Arc<tokio::sync::RwLock<()>>,
@@ -143,9 +144,44 @@ impl McpAgentServer {
         catalog_lock: Arc<tokio::sync::RwLock<()>>,
         config: McpGatewayConfig,
     ) -> Self {
+        let pod_stores = PodStoreManager::from_stores(
+            &physical_store,
+            graph_store.clone(),
+            DEFAULT_MAX_OPEN_PODS,
+            DEFAULT_POD_QUOTA_BYTES,
+        )
+        .unwrap_or_else(|_| {
+            PodStoreManager::new_in_memory_with_system_store(
+                graph_store.clone(),
+                DEFAULT_MAX_OPEN_PODS,
+                DEFAULT_POD_QUOTA_BYTES,
+            )
+            .expect("valid default PodStoreManager limits")
+        });
+        Self::with_shared_pod_stores(
+            physical_store,
+            graph_store,
+            pod_stores,
+            policy_engine,
+            disclosure_policy,
+            catalog_lock,
+            config,
+        )
+    }
+
+    pub fn with_shared_pod_stores(
+        physical_store: PhysicalStore,
+        graph_store: SemanticGraphStore,
+        pod_stores: PodStoreManager,
+        policy_engine: Arc<RwLock<PolicyEngine>>,
+        disclosure_policy: Arc<RwLock<DisclosurePolicy>>,
+        catalog_lock: Arc<tokio::sync::RwLock<()>>,
+        config: McpGatewayConfig,
+    ) -> Self {
         Self {
             physical_store,
             graph_store,
+            pod_stores,
             policy_engine,
             disclosure_policy,
             catalog_lock,
@@ -1204,39 +1240,32 @@ impl McpAgentServer {
         let mut total_redacted_triples = 0usize;
         let mut first_deny_reason: Option<String> = None;
 
-        // 1. Project PDP-permitted Cataloged Named Graphs (deterministic sorted order)
-        let mut named_graphs: Vec<NamedNode> = Vec::new();
-        for ng_res in self.graph_store.inner().named_graphs() {
-            match ng_res {
-                Ok(NamedOrBlankNode::NamedNode(n)) => named_graphs.push(n),
-                Ok(NamedOrBlankNode::BlankNode(_)) => {}
-                Err(e) => {
-                    return McpToolResult::err_text(format!(
-                        "Oxigraph named_graphs read failed: {e}"
-                    ));
-                }
+        // 1. Project PDP-permitted Cataloged Named Graphs (deterministic sorted BTreeMap order)
+        for (catalog_key, entry) in &catalog.entries {
+            if catalog_key.ends_with(".acl")
+                || !matches!(
+                    entry.kind,
+                    ResourceKind::RdfSource | ResourceKind::Container
+                )
+            {
+                continue;
             }
-        }
-        named_graphs.sort();
-
-        for gn in named_graphs {
-            let graph_iri = gn.as_str();
-            let Some(graph_resolved) = map_named_graph_to_resolved_uri(
-                graph_iri,
+            let Ok(graph_resolved) = resolve_catalog_key(
+                catalog_key,
                 &self.config.base_url,
                 &self.config.pod_uri_prefix,
             ) else {
                 continue;
             };
-
-            // Enforce catalog membership so uncommitted/orphaned graphs or non-RDF entries cannot leak
-            match catalog.entries.get(&graph_resolved.catalog_key) {
-                Some(entry)
-                    if matches!(
-                        entry.kind,
-                        ResourceKind::RdfSource | ResourceKind::Container
-                    ) => {}
-                _ => continue,
+            if graph_resolved.is_acl
+                || map_named_graph_to_resolved_uri(
+                    &graph_resolved.graph_iri,
+                    &self.config.base_url,
+                    &self.config.pod_uri_prefix,
+                )
+                .is_none()
+            {
+                continue;
             }
 
             if let Some(ref filter) = scoped_target
@@ -1251,8 +1280,20 @@ impl McpAgentServer {
 
             match self.evaluate_pdp(principal, &graph_resolved.policy_target, AccessMode::Read) {
                 AccessDecision::Permit => {
-                    let raw_triples = match self.graph_store.get_named_graph_triples(graph_iri) {
+                    let store = match self.pod_stores.store_for_path(catalog_key) {
+                        Ok(s) => s,
+                        Err(e) => return McpToolResult::err_text(e.to_string()),
+                    };
+                    let raw_triples = match store.get_named_graph_triples(&graph_resolved.graph_iri)
+                    {
                         Ok(t) => t,
+                        Err(e) => return McpToolResult::err_text(e.to_string()),
+                    };
+                    if raw_triples.is_empty() {
+                        continue;
+                    }
+                    let gn = match NamedNode::new(graph_resolved.graph_iri.as_str()) {
+                        Ok(n) => n,
                         Err(e) => return McpToolResult::err_text(e.to_string()),
                     };
                     let proj =
@@ -1841,6 +1882,12 @@ impl McpAgentServer {
             return McpToolResult::err_text(conflict_msg);
         }
 
+        let target_pod_id = match PodStoreManager::pod_id_from_canonical_path(&resolved.catalog_key)
+        {
+            Ok(opt) => opt.map(str::to_string),
+            Err(e) => return McpToolResult::err_text(e.to_string()),
+        };
+
         let existing = catalog.entries.get(&resolved.catalog_key).cloned();
         if let Some(expected_etag) = if_match_opt {
             let trimmed = expected_etag.trim();
@@ -1857,78 +1904,138 @@ impl McpAgentServer {
             }
         }
 
-        ensure_parent_containers(&mut catalog, &resolved);
+        let target_graph_store = match self.pod_stores.store_for_path(&resolved.catalog_key) {
+            Ok(s) => s,
+            Err(e) => return McpToolResult::err_text(e.to_string()),
+        };
 
         let bytes_written = payload_bytes.len();
-        // Write new storage representation BEFORE cleaning up any superseded representation
-        let (kind, stored_ct, new_etag, triples_written) = match staged {
-            StagedWrite::Container { triples } => {
-                let count = triples.len();
-                let canonical_nt =
-                    match SemanticGraphStore::serialize_triples(&triples, RdfFormat::NTriples) {
+        let old_size_bytes = existing.as_ref().map(|e| e.size_bytes).unwrap_or(0);
+
+        // Stage serialized representation & enforce per-pod quota BEFORE mutating storage
+        let (kind, stored_ct, new_etag, triples_written, new_size_bytes, projected_pod_usage) =
+            match staged {
+                StagedWrite::Container { triples } => {
+                    let count = triples.len();
+                    let canonical_nt = match SemanticGraphStore::serialize_triples(
+                        &triples,
+                        RdfFormat::NTriples,
+                    ) {
                         Ok(b) => b,
                         Err(e) => return McpToolResult::err_text(e.to_string()),
                     };
-                if let Err(e) = self
-                    .graph_store
-                    .replace_named_graph_triples(&resolved.graph_iri, &triples)
-                {
-                    return McpToolResult::err_text(e.to_string());
+                    let new_sz = canonical_nt.len() as u64;
+                    let proj_usage = if let Some(ref pod_id) = target_pod_id {
+                        let cur = catalog.pod_usage_bytes(pod_id);
+                        match self
+                            .pod_stores
+                            .check_quota_delta(pod_id, cur, old_size_bytes, new_sz)
+                        {
+                            Ok(u) => Some(u),
+                            Err(e) => return McpToolResult::err_text(e.to_string()),
+                        }
+                    } else {
+                        None
+                    };
+                    if let Err(e) = target_graph_store
+                        .replace_named_graph_triples(&resolved.graph_iri, &triples)
+                    {
+                        return McpToolResult::err_text(e.to_string());
+                    }
+                    (
+                        ResourceKind::Container,
+                        "text/turtle".to_string(),
+                        compute_etag(&canonical_nt),
+                        Some(count),
+                        new_sz,
+                        proj_usage,
+                    )
                 }
-                (
-                    ResourceKind::Container,
-                    "text/turtle".to_string(),
-                    compute_etag(&canonical_nt),
-                    Some(count),
-                )
-            }
-            StagedWrite::Rdf { triples } => {
-                let count = triples.len();
-                let canonical_nt =
-                    match SemanticGraphStore::serialize_triples(&triples, RdfFormat::NTriples) {
+                StagedWrite::Rdf { triples } => {
+                    let count = triples.len();
+                    let canonical_nt = match SemanticGraphStore::serialize_triples(
+                        &triples,
+                        RdfFormat::NTriples,
+                    ) {
                         Ok(b) => b,
                         Err(e) => return McpToolResult::err_text(e.to_string()),
                     };
-                if let Err(e) = self
-                    .graph_store
-                    .replace_named_graph_triples(&resolved.graph_iri, &triples)
-                {
-                    return McpToolResult::err_text(e.to_string());
+                    let new_sz = canonical_nt.len() as u64;
+                    let proj_usage = if let Some(ref pod_id) = target_pod_id {
+                        let cur = catalog.pod_usage_bytes(pod_id);
+                        match self
+                            .pod_stores
+                            .check_quota_delta(pod_id, cur, old_size_bytes, new_sz)
+                        {
+                            Ok(u) => Some(u),
+                            Err(e) => return McpToolResult::err_text(e.to_string()),
+                        }
+                    } else {
+                        None
+                    };
+                    if let Err(e) = target_graph_store
+                        .replace_named_graph_triples(&resolved.graph_iri, &triples)
+                    {
+                        return McpToolResult::err_text(e.to_string());
+                    }
+                    if let Some(ref prev) = existing
+                        && prev.kind == ResourceKind::NonRdfSource
+                        && let Err(e) = self.physical_store.delete(&resolved.blob_key).await
+                    {
+                        return McpToolResult::err_text(e.to_string());
+                    }
+                    (
+                        ResourceKind::RdfSource,
+                        "text/turtle".to_string(),
+                        compute_etag(&canonical_nt),
+                        Some(count),
+                        new_sz,
+                        proj_usage,
+                    )
                 }
-                if let Some(ref prev) = existing
-                    && prev.kind == ResourceKind::NonRdfSource
-                    && let Err(e) = self.physical_store.delete(&resolved.blob_key).await
-                {
-                    return McpToolResult::err_text(e.to_string());
+                StagedWrite::Blob {
+                    content_type,
+                    bytes,
+                } => {
+                    let new_sz = bytes.len() as u64;
+                    let proj_usage = if let Some(ref pod_id) = target_pod_id {
+                        let cur = catalog.pod_usage_bytes(pod_id);
+                        match self
+                            .pod_stores
+                            .check_quota_delta(pod_id, cur, old_size_bytes, new_sz)
+                        {
+                            Ok(u) => Some(u),
+                            Err(e) => return McpToolResult::err_text(e.to_string()),
+                        }
+                    } else {
+                        None
+                    };
+                    let etag = compute_etag(&bytes);
+                    if let Err(e) = self
+                        .physical_store
+                        .put_with_content_type(&resolved.blob_key, bytes, &content_type)
+                        .await
+                    {
+                        return McpToolResult::err_text(e.to_string());
+                    }
+                    if let Some(ref prev) = existing
+                        && prev.kind == ResourceKind::RdfSource
+                        && let Err(e) = target_graph_store.delete_named_graph(&resolved.graph_iri)
+                    {
+                        return McpToolResult::err_text(e.to_string());
+                    }
+                    (
+                        ResourceKind::NonRdfSource,
+                        content_type,
+                        etag,
+                        None,
+                        new_sz,
+                        proj_usage,
+                    )
                 }
-                (
-                    ResourceKind::RdfSource,
-                    "text/turtle".to_string(),
-                    compute_etag(&canonical_nt),
-                    Some(count),
-                )
-            }
-            StagedWrite::Blob {
-                content_type,
-                bytes,
-            } => {
-                let etag = compute_etag(&bytes);
-                if let Err(e) = self
-                    .physical_store
-                    .put_with_content_type(&resolved.blob_key, bytes, &content_type)
-                    .await
-                {
-                    return McpToolResult::err_text(e.to_string());
-                }
-                if let Some(ref prev) = existing
-                    && prev.kind == ResourceKind::RdfSource
-                    && let Err(e) = self.graph_store.delete_named_graph(&resolved.graph_iri)
-                {
-                    return McpToolResult::err_text(e.to_string());
-                }
-                (ResourceKind::NonRdfSource, content_type, etag, None)
-            }
-        };
+            };
+
+        ensure_parent_containers(&mut catalog, &resolved);
 
         catalog.entries.insert(
             resolved.catalog_key.clone(),
@@ -1937,13 +2044,14 @@ impl McpAgentServer {
                 kind,
                 content_type: stored_ct.clone(),
                 etag: new_etag.clone(),
+                size_bytes: new_size_bytes,
             },
         );
         if let Err(e) = catalog.persist(&self.physical_store).await {
             if existing.is_none() {
                 match kind {
                     ResourceKind::Container | ResourceKind::RdfSource => {
-                        let _ = self.graph_store.delete_named_graph(&resolved.graph_iri);
+                        let _ = target_graph_store.delete_named_graph(&resolved.graph_iri);
                     }
                     ResourceKind::NonRdfSource => {
                         let _ = self.physical_store.delete(&resolved.blob_key).await;
@@ -1951,6 +2059,9 @@ impl McpAgentServer {
                 }
             }
             return McpToolResult::err_text(e.to_string());
+        }
+        if let (Some(pod_id), Some(used)) = (target_pod_id.as_deref(), projected_pod_usage) {
+            self.pod_stores.record_pod_usage(pod_id, used);
         }
 
         McpToolResult::ok_json(&json!({
@@ -2170,9 +2281,8 @@ impl McpAgentServer {
         resolved: &ResolvedPodUri,
         kind: ResourceKind,
     ) -> Result<Vec<Triple>> {
-        let mut triples = self
-            .graph_store
-            .get_named_graph_triples(&resolved.graph_iri)?;
+        let store = self.pod_stores.store_for_path(&resolved.catalog_key)?;
+        let mut triples = store.get_named_graph_triples(&resolved.graph_iri)?;
 
         if kind == ResourceKind::Container {
             let container_node = NamedNode::new(&resolved.graph_iri).map_err(|e| {
@@ -2562,6 +2672,7 @@ fn ensure_parent_containers(catalog: &mut PodCatalog, resolved: &ResolvedPodUri)
                 kind: ResourceKind::Container,
                 content_type: "text/turtle".to_string(),
                 etag: compute_etag(current_rel.as_bytes()),
+                size_bytes: 0,
             });
     }
 }

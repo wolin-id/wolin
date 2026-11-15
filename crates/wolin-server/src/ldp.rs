@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use axum::{
@@ -13,7 +13,7 @@ use wolin_core::{Principal, ResourceKind, ResourceUri, WebId};
 use wolin_policy::{AccessDecision, AccessMode, PolicyEngine, SubjectMatcher, WacRule};
 #[allow(deprecated)]
 use wolin_storage::{
-    PhysicalStore, SemanticGraphStore,
+    PhysicalStore, PodStoreManager, SemanticGraphStore,
     rdf_io::{JsonLdProfileSet, RdfFormat},
     rdf_model::{NamedNode, NamedOrBlankNode, Term, Triple},
     rdf_sparql::Update as SparqlUpdate,
@@ -71,6 +71,8 @@ pub struct LdpEntry {
     pub kind: ResourceKind,
     pub content_type: String,
     pub etag: String,
+    #[serde(default)]
+    pub size_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,6 +90,7 @@ impl Default for LdpCatalog {
                 kind: ResourceKind::Container,
                 content_type: "text/turtle".to_string(),
                 etag: compute_etag(b"root-container-v0"),
+                size_bytes: 0,
             },
         );
         Self { entries }
@@ -101,6 +104,14 @@ impl LdpCatalog {
             let mut catalog: Self = serde_json::from_slice(&bytes).map_err(|e| {
                 wolin_core::WolinError::Storage(format!("Corrupt LDP catalog metadata: {e}"))
             })?;
+            for entry in catalog.entries.values_mut() {
+                if entry.size_bytes == 0
+                    && entry.kind != ResourceKind::Container
+                    && let Some(inferred) = infer_size_from_wolin_etag(&entry.etag)
+                {
+                    entry.size_bytes = inferred;
+                }
+            }
             catalog
                 .entries
                 .entry("/".to_string())
@@ -109,6 +120,7 @@ impl LdpCatalog {
                     kind: ResourceKind::Container,
                     content_type: "text/turtle".to_string(),
                     etag: compute_etag(b"root-container-v0"),
+                    size_bytes: 0,
                 });
             Ok(catalog)
         } else {
@@ -123,6 +135,32 @@ impl LdpCatalog {
             .put_with_content_type(CATALOG_META_KEY, bytes, "application/json")
             .await?;
         Ok(())
+    }
+
+    pub fn pod_usage_bytes(&self, pod_id: &str) -> u64 {
+        self.entries
+            .values()
+            .filter(|entry| {
+                PodStoreManager::pod_id_from_canonical_path(&entry.path)
+                    .ok()
+                    .flatten()
+                    == Some(pod_id)
+            })
+            .fold(0u64, |acc, entry| acc.saturating_add(entry.size_bytes))
+    }
+
+    pub fn all_pod_usages(&self) -> HashMap<String, u64> {
+        let mut totals = HashMap::new();
+        for entry in self.entries.values() {
+            if entry.size_bytes == 0 {
+                continue;
+            }
+            if let Ok(Some(pod_id)) = PodStoreManager::pod_id_from_canonical_path(&entry.path) {
+                let cur = totals.entry(pod_id.to_string()).or_insert(0u64);
+                *cur = cur.saturating_add(entry.size_bytes);
+            }
+        }
+        totals
     }
 
     pub fn direct_children(&self, container_path: &str) -> Vec<&LdpEntry> {
@@ -140,6 +178,15 @@ impl LdpCatalog {
             })
             .collect()
     }
+}
+
+fn infer_size_from_wolin_etag(etag: &str) -> Option<u64> {
+    let inner = etag.strip_prefix('"')?.strip_suffix('"')?;
+    let (hash_hex, len_hex) = inner.split_once('-')?;
+    if hash_hex.len() != 32 || !hash_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u64::from_str_radix(len_hex, 16).ok()
 }
 
 #[derive(Debug, Clone)]
@@ -232,6 +279,7 @@ async fn handle_options(
         AccessMode::Read
     };
     authorize(state, principal, &target.policy_target, required_mode)?;
+    let _ = PodStoreManager::pod_id_from_canonical_path(&target.canonical_path)?;
 
     let catalog = state.catalog.read().await;
     let kind = catalog
@@ -263,6 +311,7 @@ async fn handle_get_or_head(
         AccessMode::Read
     };
     authorize(state, principal, &target.policy_target, required_mode)?;
+    let _ = PodStoreManager::pod_id_from_canonical_path(&target.canonical_path)?;
 
     let catalog = state.catalog.read().await;
     let Some(entry) = catalog.entries.get(&target.canonical_path).cloned() else {
@@ -279,7 +328,8 @@ async fn handle_get_or_head(
             let negotiated_format = negotiate_rdf_format(headers)?;
             let children = catalog.direct_children(&entry.path);
             let mut etag_material = entry.etag.clone();
-            let mut triples = state.graph_store.get_named_graph_triples(&resource_iri)?;
+            let target_graph_store = state.pod_stores.store_for_path(&entry.path)?;
+            let mut triples = target_graph_store.get_named_graph_triples(&resource_iri)?;
 
             let container_node = NamedNode::new(&resource_iri)
                 .map_err(|e| LdpError::Internal(format!("Invalid container IRI: {e}")))?;
@@ -367,7 +417,8 @@ async fn handle_get_or_head(
             }
             check_if_match_get(headers, &entry.etag)?;
 
-            let triples = state.graph_store.get_named_graph_triples(&resource_iri)?;
+            let target_graph_store = state.pod_stores.store_for_path(&entry.path)?;
+            let triples = target_graph_store.get_named_graph_triples(&resource_iri)?;
             let rebased = target.rebase_triples_for_response(&state.config.base_url, triples);
             let serialized = SemanticGraphStore::serialize_triples(&rebased, negotiated_format)?;
             build_payload_response(
@@ -430,6 +481,8 @@ async fn handle_put(
     };
     // Enforce WAC / ACP authorization BEFORE reading payload or mutating storage.
     authorize(state, principal, &target.policy_target, required_mode)?;
+    let target_pod_id =
+        PodStoreManager::pod_id_from_canonical_path(&target.canonical_path)?.map(str::to_string);
 
     let body_bytes = read_bounded_body(body, state.config.max_body_bytes).await?;
     let link_types = parse_link_type_iris(headers)?;
@@ -552,23 +605,47 @@ async fn handle_put(
 
     let existing = catalog.entries.get(&target.canonical_path).cloned();
     check_write_preconditions(headers, existing.as_ref().map(|e| e.etag.as_str()))?;
+    let old_size_bytes = existing.as_ref().map(|e| e.size_bytes).unwrap_or(0);
+    let target_graph_store = state.pod_stores.store_for_path(&target.canonical_path)?;
 
-    ensure_parent_containers(&mut catalog, &target.canonical_path);
-
-    let (kind, stored_ct, new_etag) = match prepared {
+    let (kind, stored_ct, new_etag, new_size_bytes, projected_pod_usage) = match prepared {
         PreparedWrite::Container { triples } => {
-            state
-                .graph_store
-                .replace_named_graph_triples(&resource_iri, &triples)?;
             let canonical_nt =
                 SemanticGraphStore::serialize_triples(&triples, RdfFormat::NTriples)?;
+            let new_sz = canonical_nt.len() as u64;
+            let proj_usage = if let Some(ref pod_id) = target_pod_id {
+                let cur = catalog.pod_usage_bytes(pod_id);
+                Some(
+                    state
+                        .pod_stores
+                        .check_quota_delta(pod_id, cur, old_size_bytes, new_sz)?,
+                )
+            } else {
+                None
+            };
+            target_graph_store.replace_named_graph_triples(&resource_iri, &triples)?;
             (
                 ResourceKind::Container,
                 "text/turtle".to_string(),
                 compute_etag(&canonical_nt),
+                new_sz,
+                proj_usage,
             )
         }
         PreparedWrite::Rdf { triples } => {
+            let canonical_nt =
+                SemanticGraphStore::serialize_triples(&triples, RdfFormat::NTriples)?;
+            let new_sz = canonical_nt.len() as u64;
+            let proj_usage = if let Some(ref pod_id) = target_pod_id {
+                let cur = catalog.pod_usage_bytes(pod_id);
+                Some(
+                    state
+                        .pod_stores
+                        .check_quota_delta(pod_id, cur, old_size_bytes, new_sz)?,
+                )
+            } else {
+                None
+            };
             if let Some(ref prev) = existing
                 && prev.kind == ResourceKind::NonRdfSource
             {
@@ -577,23 +654,30 @@ async fn handle_put(
                     .delete(&blob_key_for_path(&target.canonical_path))
                     .await;
             }
-            state
-                .graph_store
-                .replace_named_graph_triples(&resource_iri, &triples)?;
-            let canonical_nt =
-                SemanticGraphStore::serialize_triples(&triples, RdfFormat::NTriples)?;
+            target_graph_store.replace_named_graph_triples(&resource_iri, &triples)?;
             (
                 ResourceKind::RdfSource,
                 "text/turtle".to_string(),
                 compute_etag(&canonical_nt),
+                new_sz,
+                proj_usage,
             )
         }
         PreparedWrite::Acl { triples, rules } => {
-            state
-                .graph_store
-                .replace_named_graph_triples(&resource_iri, &triples)?;
             let canonical_nt =
                 SemanticGraphStore::serialize_triples(&triples, RdfFormat::NTriples)?;
+            let new_sz = canonical_nt.len() as u64;
+            let proj_usage = if let Some(ref pod_id) = target_pod_id {
+                let cur = catalog.pod_usage_bytes(pod_id);
+                Some(
+                    state
+                        .pod_stores
+                        .check_quota_delta(pod_id, cur, old_size_bytes, new_sz)?,
+                )
+            } else {
+                None
+            };
+            target_graph_store.replace_named_graph_triples(&resource_iri, &triples)?;
             let rule_prefix = acl_rule_prefix(&target.canonical_path);
             {
                 let mut engine = state
@@ -609,16 +693,29 @@ async fn handle_put(
                 ResourceKind::RdfSource,
                 "text/turtle".to_string(),
                 compute_etag(&canonical_nt),
+                new_sz,
+                proj_usage,
             )
         }
         PreparedWrite::Blob {
             content_type,
             bytes,
         } => {
+            let new_sz = bytes.len() as u64;
+            let proj_usage = if let Some(ref pod_id) = target_pod_id {
+                let cur = catalog.pod_usage_bytes(pod_id);
+                Some(
+                    state
+                        .pod_stores
+                        .check_quota_delta(pod_id, cur, old_size_bytes, new_sz)?,
+                )
+            } else {
+                None
+            };
             if let Some(ref prev) = existing
                 && prev.kind == ResourceKind::RdfSource
             {
-                let _ = state.graph_store.delete_named_graph(&resource_iri);
+                let _ = target_graph_store.delete_named_graph(&resource_iri);
             }
             let etag = compute_etag(&bytes);
             let blob_key = blob_key_for_path(&target.canonical_path);
@@ -626,9 +723,17 @@ async fn handle_put(
                 .physical_store
                 .put_with_content_type(&blob_key, bytes, &content_type)
                 .await?;
-            (ResourceKind::NonRdfSource, content_type, etag)
+            (
+                ResourceKind::NonRdfSource,
+                content_type,
+                etag,
+                new_sz,
+                proj_usage,
+            )
         }
     };
+
+    ensure_parent_containers(&mut catalog, &target.canonical_path);
 
     catalog.entries.insert(
         target.canonical_path.clone(),
@@ -637,9 +742,13 @@ async fn handle_put(
             kind,
             content_type: stored_ct,
             etag: new_etag.clone(),
+            size_bytes: new_size_bytes,
         },
     );
     catalog.persist(&state.physical_store).await?;
+    if let (Some(pod_id), Some(used)) = (target_pod_id.as_deref(), projected_pod_usage) {
+        state.pod_stores.record_pod_usage(pod_id, used);
+    }
     drop(catalog);
     drop(_io_guard);
 
@@ -749,105 +858,156 @@ async fn handle_post(
 
     let child_iri = http_iri(&state.config.base_url, &child_path);
     let ext_child_iri = child_target.external_iri(&state.config.base_url, &child_path);
+    let child_pod_id =
+        PodStoreManager::pod_id_from_canonical_path(&child_path)?.map(str::to_string);
+    let child_graph_store = state.pod_stores.store_for_path(&child_path)?;
 
-    let (child_kind, stored_ct, new_etag) = if requested_container {
-        let triples = if body_bytes.is_empty() {
-            if let Some(ct) = raw_ct.as_deref()
-                && parse_rdf_media_type(ct).is_none()
-            {
-                return Err(LdpError::UnsupportedMediaType(format!(
-                    "Unsupported Content-Type '{ct}' for LDP BasicContainer"
-                )));
-            }
-            Vec::new()
-        } else {
-            let ct = raw_ct.as_deref().unwrap_or("text/turtle");
-            let rdf_fmt = parse_rdf_media_type(ct).ok_or_else(|| {
-                LdpError::UnsupportedMediaType(format!(
-                    "Unsupported Content-Type '{ct}' for LDP BasicContainer"
-                ))
-            })?;
-            let parsed =
-                SemanticGraphStore::parse_rdf_triples(&body_bytes, rdf_fmt, &ext_child_iri)?;
-            child_target.rebase_triples_for_storage(&state.config.base_url, parsed)
-        };
-        reject_client_contains_triples(&triples)?;
-        state
-            .graph_store
-            .replace_named_graph_triples(&child_iri, &triples)?;
-        let canonical_nt = SemanticGraphStore::serialize_triples(&triples, RdfFormat::NTriples)?;
-        (
-            ResourceKind::Container,
-            "text/turtle".to_string(),
-            compute_etag(&canonical_nt),
-        )
-    } else {
-        match raw_ct.as_deref() {
-            Some(ct) if !requested_non_rdf && parse_rdf_media_type(ct).is_some() => {
-                let rdf_fmt = parse_rdf_media_type(ct).unwrap();
+    let (child_kind, stored_ct, new_etag, new_size_bytes, projected_pod_usage) =
+        if requested_container {
+            let triples = if body_bytes.is_empty() {
+                if let Some(ct) = raw_ct.as_deref()
+                    && parse_rdf_media_type(ct).is_none()
+                {
+                    return Err(LdpError::UnsupportedMediaType(format!(
+                        "Unsupported Content-Type '{ct}' for LDP BasicContainer"
+                    )));
+                }
+                Vec::new()
+            } else {
+                let ct = raw_ct.as_deref().unwrap_or("text/turtle");
+                let rdf_fmt = parse_rdf_media_type(ct).ok_or_else(|| {
+                    LdpError::UnsupportedMediaType(format!(
+                        "Unsupported Content-Type '{ct}' for LDP BasicContainer"
+                    ))
+                })?;
                 let parsed =
                     SemanticGraphStore::parse_rdf_triples(&body_bytes, rdf_fmt, &ext_child_iri)?;
-                let triples =
-                    child_target.rebase_triples_for_storage(&state.config.base_url, parsed);
-                state
-                    .graph_store
-                    .replace_named_graph_triples(&child_iri, &triples)?;
-                let canonical_nt =
-                    SemanticGraphStore::serialize_triples(&triples, RdfFormat::NTriples)?;
-                (
-                    ResourceKind::RdfSource,
-                    "text/turtle".to_string(),
-                    compute_etag(&canonical_nt),
-                )
+                child_target.rebase_triples_for_storage(&state.config.base_url, parsed)
+            };
+            reject_client_contains_triples(&triples)?;
+            let canonical_nt =
+                SemanticGraphStore::serialize_triples(&triples, RdfFormat::NTriples)?;
+            let new_sz = canonical_nt.len() as u64;
+            let proj_usage = if let Some(ref pod_id) = child_pod_id {
+                let cur = catalog.pod_usage_bytes(pod_id);
+                Some(state.pod_stores.check_quota_delta(pod_id, cur, 0, new_sz)?)
+            } else {
+                None
+            };
+            child_graph_store.replace_named_graph_triples(&child_iri, &triples)?;
+            (
+                ResourceKind::Container,
+                "text/turtle".to_string(),
+                compute_etag(&canonical_nt),
+                new_sz,
+                proj_usage,
+            )
+        } else {
+            match raw_ct.as_deref() {
+                Some(ct) if !requested_non_rdf && parse_rdf_media_type(ct).is_some() => {
+                    let rdf_fmt = parse_rdf_media_type(ct).unwrap();
+                    let parsed = SemanticGraphStore::parse_rdf_triples(
+                        &body_bytes,
+                        rdf_fmt,
+                        &ext_child_iri,
+                    )?;
+                    let triples =
+                        child_target.rebase_triples_for_storage(&state.config.base_url, parsed);
+                    let canonical_nt =
+                        SemanticGraphStore::serialize_triples(&triples, RdfFormat::NTriples)?;
+                    let new_sz = canonical_nt.len() as u64;
+                    let proj_usage = if let Some(ref pod_id) = child_pod_id {
+                        let cur = catalog.pod_usage_bytes(pod_id);
+                        Some(state.pod_stores.check_quota_delta(pod_id, cur, 0, new_sz)?)
+                    } else {
+                        None
+                    };
+                    child_graph_store.replace_named_graph_triples(&child_iri, &triples)?;
+                    (
+                        ResourceKind::RdfSource,
+                        "text/turtle".to_string(),
+                        compute_etag(&canonical_nt),
+                        new_sz,
+                        proj_usage,
+                    )
+                }
+                None if requested_rdf_source => {
+                    let parsed = SemanticGraphStore::parse_rdf_triples(
+                        &body_bytes,
+                        RdfFormat::Turtle,
+                        &ext_child_iri,
+                    )?;
+                    let triples =
+                        child_target.rebase_triples_for_storage(&state.config.base_url, parsed);
+                    let canonical_nt =
+                        SemanticGraphStore::serialize_triples(&triples, RdfFormat::NTriples)?;
+                    let new_sz = canonical_nt.len() as u64;
+                    let proj_usage = if let Some(ref pod_id) = child_pod_id {
+                        let cur = catalog.pod_usage_bytes(pod_id);
+                        Some(state.pod_stores.check_quota_delta(pod_id, cur, 0, new_sz)?)
+                    } else {
+                        None
+                    };
+                    child_graph_store.replace_named_graph_triples(&child_iri, &triples)?;
+                    (
+                        ResourceKind::RdfSource,
+                        "text/turtle".to_string(),
+                        compute_etag(&canonical_nt),
+                        new_sz,
+                        proj_usage,
+                    )
+                }
+                Some(ct) if requested_rdf_source => {
+                    return Err(LdpError::UnsupportedMediaType(format!(
+                        "Unsupported RDF Content-Type '{ct}' for LDP RDFSource"
+                    )));
+                }
+                Some(ct) => {
+                    let new_sz = body_bytes.len() as u64;
+                    let proj_usage = if let Some(ref pod_id) = child_pod_id {
+                        let cur = catalog.pod_usage_bytes(pod_id);
+                        Some(state.pod_stores.check_quota_delta(pod_id, cur, 0, new_sz)?)
+                    } else {
+                        None
+                    };
+                    let etag = compute_etag(&body_bytes);
+                    let blob_key = blob_key_for_path(&child_path);
+                    state
+                        .physical_store
+                        .put_with_content_type(&blob_key, body_bytes, ct)
+                        .await?;
+                    (
+                        ResourceKind::NonRdfSource,
+                        ct.to_string(),
+                        etag,
+                        new_sz,
+                        proj_usage,
+                    )
+                }
+                None => {
+                    let new_sz = body_bytes.len() as u64;
+                    let proj_usage = if let Some(ref pod_id) = child_pod_id {
+                        let cur = catalog.pod_usage_bytes(pod_id);
+                        Some(state.pod_stores.check_quota_delta(pod_id, cur, 0, new_sz)?)
+                    } else {
+                        None
+                    };
+                    let etag = compute_etag(&body_bytes);
+                    let blob_key = blob_key_for_path(&child_path);
+                    state
+                        .physical_store
+                        .put_with_content_type(&blob_key, body_bytes, "application/octet-stream")
+                        .await?;
+                    (
+                        ResourceKind::NonRdfSource,
+                        "application/octet-stream".to_string(),
+                        etag,
+                        new_sz,
+                        proj_usage,
+                    )
+                }
             }
-            None if requested_rdf_source => {
-                let parsed = SemanticGraphStore::parse_rdf_triples(
-                    &body_bytes,
-                    RdfFormat::Turtle,
-                    &ext_child_iri,
-                )?;
-                let triples =
-                    child_target.rebase_triples_for_storage(&state.config.base_url, parsed);
-                state
-                    .graph_store
-                    .replace_named_graph_triples(&child_iri, &triples)?;
-                let canonical_nt =
-                    SemanticGraphStore::serialize_triples(&triples, RdfFormat::NTriples)?;
-                (
-                    ResourceKind::RdfSource,
-                    "text/turtle".to_string(),
-                    compute_etag(&canonical_nt),
-                )
-            }
-            Some(ct) if requested_rdf_source => {
-                return Err(LdpError::UnsupportedMediaType(format!(
-                    "Unsupported RDF Content-Type '{ct}' for LDP RDFSource"
-                )));
-            }
-            Some(ct) => {
-                let etag = compute_etag(&body_bytes);
-                let blob_key = blob_key_for_path(&child_path);
-                state
-                    .physical_store
-                    .put_with_content_type(&blob_key, body_bytes, ct)
-                    .await?;
-                (ResourceKind::NonRdfSource, ct.to_string(), etag)
-            }
-            None => {
-                let etag = compute_etag(&body_bytes);
-                let blob_key = blob_key_for_path(&child_path);
-                state
-                    .physical_store
-                    .put_with_content_type(&blob_key, body_bytes, "application/octet-stream")
-                    .await?;
-                (
-                    ResourceKind::NonRdfSource,
-                    "application/octet-stream".to_string(),
-                    etag,
-                )
-            }
-        }
-    };
+        };
 
     catalog.entries.insert(
         child_path.clone(),
@@ -856,9 +1016,13 @@ async fn handle_post(
             kind: child_kind,
             content_type: stored_ct,
             etag: new_etag.clone(),
+            size_bytes: new_size_bytes,
         },
     );
     catalog.persist(&state.physical_store).await?;
+    if let (Some(pod_id), Some(used)) = (child_pod_id.as_deref(), projected_pod_usage) {
+        state.pod_stores.record_pod_usage(pod_id, used);
+    }
     drop(catalog);
     drop(_io_guard);
 
@@ -892,6 +1056,8 @@ async fn handle_patch(
         AccessMode::Append
     };
     authorize(state, principal, &target.policy_target, min_mode)?;
+    let target_pod_id =
+        PodStoreManager::pod_id_from_canonical_path(&target.canonical_path)?.map(str::to_string);
 
     match extract_media_type(headers).as_deref() {
         Some("application/sparql-update") => {}
@@ -938,6 +1104,8 @@ async fn handle_patch(
 
     let existing = catalog.entries.get(&target.canonical_path).cloned();
     check_write_preconditions(headers, existing.as_ref().map(|e| e.etag.as_str()))?;
+    let old_size_bytes = existing.as_ref().map(|e| e.size_bytes).unwrap_or(0);
+    let target_graph_store = state.pod_stores.store_for_path(&target.canonical_path)?;
 
     let current_triples = match &existing {
         Some(entry) if entry.kind == ResourceKind::NonRdfSource => {
@@ -947,7 +1115,7 @@ async fn handle_patch(
             ));
         }
         Some(_) => {
-            let stored = state.graph_store.get_named_graph_triples(&resource_iri)?;
+            let stored = target_graph_store.get_named_graph_triples(&resource_iri)?;
             target.rebase_triples_for_response(&state.config.base_url, stored)
         }
         None => {
@@ -1012,13 +1180,23 @@ async fn handle_patch(
         None
     };
 
-    ensure_parent_containers(&mut catalog, &target.canonical_path);
-    state
-        .graph_store
-        .replace_named_graph_triples(&resource_iri, &updated_triples)?;
     let canonical_nt =
         SemanticGraphStore::serialize_triples(&updated_triples, RdfFormat::NTriples)?;
+    let new_size_bytes = canonical_nt.len() as u64;
+    let projected_pod_usage = if let Some(ref pod_id) = target_pod_id {
+        let cur = catalog.pod_usage_bytes(pod_id);
+        Some(
+            state
+                .pod_stores
+                .check_quota_delta(pod_id, cur, old_size_bytes, new_size_bytes)?,
+        )
+    } else {
+        None
+    };
+
+    target_graph_store.replace_named_graph_triples(&resource_iri, &updated_triples)?;
     let new_etag = compute_etag(&canonical_nt);
+    ensure_parent_containers(&mut catalog, &target.canonical_path);
 
     if let Some(rules) = acl_rules {
         let rule_prefix = acl_rule_prefix(&target.canonical_path);
@@ -1044,9 +1222,13 @@ async fn handle_patch(
             kind,
             content_type: "text/turtle".to_string(),
             etag: new_etag.clone(),
+            size_bytes: new_size_bytes,
         },
     );
     catalog.persist(&state.physical_store).await?;
+    if let (Some(pod_id), Some(used)) = (target_pod_id.as_deref(), projected_pod_usage) {
+        state.pod_stores.record_pod_usage(pod_id, used);
+    }
     drop(catalog);
     drop(_io_guard);
 
@@ -1085,6 +1267,8 @@ async fn handle_delete(
     };
     // Enforce WAC / ACP authorization BEFORE inspecting or mutating storage.
     authorize(state, principal, &target.policy_target, required_mode)?;
+    let target_pod_id =
+        PodStoreManager::pod_id_from_canonical_path(&target.canonical_path)?.map(str::to_string);
 
     if target.canonical_path == "/" {
         return Err(LdpError::MethodNotAllowed {
@@ -1119,9 +1303,10 @@ async fn handle_delete(
     }
 
     let resource_iri = http_iri(&state.config.base_url, &entry.path);
+    let target_graph_store = state.pod_stores.store_for_path(&entry.path)?;
     match entry.kind {
         ResourceKind::Container | ResourceKind::RdfSource => {
-            state.graph_store.delete_named_graph(&resource_iri)?;
+            target_graph_store.delete_named_graph(&resource_iri)?;
         }
         ResourceKind::NonRdfSource => {
             state
@@ -1140,7 +1325,7 @@ async fn handle_delete(
             .remove_wac_rules_by_prefix(&prefix);
     } else if catalog.entries.remove(&target.acl_path).is_some() {
         let acl_iri = http_iri(&state.config.base_url, &target.acl_path);
-        let _ = state.graph_store.delete_named_graph(&acl_iri);
+        let _ = target_graph_store.delete_named_graph(&acl_iri);
         let prefix = acl_rule_prefix(&target.acl_path);
         state
             .policy_engine
@@ -1151,6 +1336,11 @@ async fn handle_delete(
 
     catalog.entries.remove(&target.canonical_path);
     catalog.persist(&state.physical_store).await?;
+    if let Some(ref pod_id) = target_pod_id {
+        state
+            .pod_stores
+            .record_pod_usage(pod_id, catalog.pod_usage_bytes(pod_id));
+    }
     drop(catalog);
     drop(_io_guard);
 
@@ -1490,6 +1680,7 @@ fn parse_ldp_path_str(raw_path: &str, pod_prefix: &str) -> Result<LdpTarget, Ldp
         canonical.push('/');
     }
 
+    let _ = PodStoreManager::pod_id_from_canonical_path(&canonical)?;
     Ok(build_ldp_target_from_canonical(&canonical, pod_prefix))
 }
 
@@ -2216,6 +2407,7 @@ fn ensure_parent_containers(catalog: &mut LdpCatalog, canonical_path: &str) {
                 kind: ResourceKind::Container,
                 content_type: "text/turtle".to_string(),
                 etag: compute_etag(current.as_bytes()),
+                size_bytes: 0,
             });
     }
 }
@@ -2304,7 +2496,7 @@ pub(crate) fn acl_rule_prefix(acl_canonical_path: &str) -> String {
 }
 
 pub(crate) fn rehydrate_persisted_acl_rules(
-    graph_store: &SemanticGraphStore,
+    pod_stores: &PodStoreManager,
     catalog: &LdpCatalog,
     policy_engine: &mut PolicyEngine,
     config: &crate::LdpConfig,
@@ -2315,7 +2507,8 @@ pub(crate) fn rehydrate_persisted_acl_rules(
         }
         let target = build_ldp_target_from_canonical(path, &config.pod_uri_prefix);
         let acl_iri = http_iri(&config.base_url, path);
-        let triples = graph_store.get_named_graph_triples(&acl_iri)?;
+        let store = pod_stores.store_for_path(path)?;
+        let triples = store.get_named_graph_triples(&acl_iri)?;
         if triples.is_empty() {
             continue;
         }

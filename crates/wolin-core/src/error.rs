@@ -17,6 +17,9 @@ pub enum WolinError {
     #[error("Semantic/RDF error: {0}")]
     Semantic(String),
 
+    #[error("Storage quota exceeded: {0}")]
+    QuotaExceeded(String),
+
     #[error("Invalid resource format: {0}")]
     InvalidFormat(String),
 

@@ -12,7 +12,7 @@ use serde_json::json;
 use wolin_core::{Principal, ResourceKind};
 use wolin_identity::DidResolver;
 use wolin_storage::{
-    SemanticGraphStore,
+    PodStoreManager, SemanticGraphStore,
     rdf_io::RdfFormat,
     rdf_model::{Literal, NamedNode, NamedOrBlankNode, Term, Triple},
 };
@@ -29,28 +29,10 @@ use crate::{
     },
 };
 
-const MAX_POD_ID_LEN: usize = 63;
 const MAX_DISPLAY_NAME_LEN: usize = 256;
 const MAX_PROVISION_BODY_BYTES: usize = 64 * 1024;
 
 const INFRA_SUBDOMAINS: &[&str] = &["pod", "pods", "api", "auth", "login", "id", "www", "mcp"];
-const RESERVED_POD_IDS: &[&str] = &[
-    "pod",
-    "pods",
-    "api",
-    "auth",
-    "login",
-    "id",
-    "www",
-    "mcp",
-    "health",
-    "healthz",
-    "public",
-    "private",
-    "admin",
-    "system",
-    "well-known",
-];
 
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const DCTERMS_TITLE: &str = "http://purl.org/dc/terms/title";
@@ -101,29 +83,7 @@ pub struct ProvisionPodResponse {
 /// Validate that `pod_id` is a safe RFC 1123 lowercase DNS label (`[a-z0-9-]`, 1..=63 chars)
 /// and does not collide with reserved infrastructure/system routes.
 pub fn validate_pod_id(pod_id: &str) -> Result<(), LdpError> {
-    if pod_id.is_empty() || pod_id.len() > MAX_POD_ID_LEN {
-        return Err(LdpError::BadRequest(
-            "pod_id must be between 1 and 63 lowercase characters".to_string(),
-        ));
-    }
-    if pod_id.starts_with('-')
-        || pod_id.ends_with('-')
-        || pod_id.starts_with("__wolin_")
-        || !pod_id
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-    {
-        return Err(LdpError::BadRequest(
-            "pod_id must contain only lowercase ASCII letters, digits, or interior hyphens"
-                .to_string(),
-        ));
-    }
-    if RESERVED_POD_IDS.contains(&pod_id) {
-        return Err(LdpError::BadRequest(format!(
-            "pod_id '{pod_id}' is reserved for system infrastructure"
-        )));
-    }
-    Ok(())
+    PodStoreManager::validate_pod_id(pod_id).map_err(LdpError::from)
 }
 
 /// Inspect `Host` header (or request URI authority) to resolve tenant subdomain routing
@@ -345,21 +305,21 @@ pub async fn handle_provision_pod(
     let mut catalog = state.catalog.write().await;
     *catalog = LdpCatalog::load_or_init(&state.physical_store).await?;
 
-    if catalog.entries.contains_key(&pod_root_path) {
+    if catalog.entries.contains_key("/pods") {
+        return Err(LdpError::Conflict(
+            "Ancestor '/pods' is occupied by a non-container resource".to_string(),
+        ));
+    }
+    if catalog.entries.contains_key(&pod_root_path)
+        || catalog
+            .entries
+            .keys()
+            .any(|existing| existing.starts_with(&pod_root_path))
+    {
         return Err(LdpError::Conflict(format!(
             "Pod '{pod_id}' is already provisioned"
         )));
     }
-
-    catalog
-        .entries
-        .entry("/pods/".to_string())
-        .or_insert_with(|| LdpEntry {
-            path: "/pods/".to_string(),
-            kind: ResourceKind::Container,
-            content_type: "text/turtle".to_string(),
-            etag: compute_etag(b"/pods/"),
-        });
 
     let subdomain_webid = format!("{subdomain_url}profile/card#me");
     let mut owner_list = vec![pod_webid.clone()];
@@ -372,6 +332,7 @@ pub async fn handle_provision_pod(
     let owners: Vec<&str> = owner_list.iter().map(String::as_str).collect();
 
     let mut seeded_paths = Vec::new();
+    let mut staged_rdf_entries = Vec::new();
     let mut compiled_wac_batches = Vec::new();
 
     // 1. Pod Root Container `/pods/{pod_id}/`
@@ -380,12 +341,11 @@ pub async fn handle_provision_pod(
         literal_triple(&pod_root_iri, DCTERMS_TITLE, &display_name)?,
         named_triple(&pod_root_iri, LDP_INBOX_REL, &inbox_iri)?,
     ];
-    store_rdf_entry(
-        &state,
-        &mut catalog,
+    stage_rdf_entry(
+        &mut staged_rdf_entries,
         &pod_root_path,
         ResourceKind::Container,
-        &root_triples,
+        root_triples,
     )?;
     seeded_paths.push(pod_root_path.clone());
 
@@ -399,19 +359,22 @@ pub async fn handle_provision_pod(
         &owners,
         AclGrantProfile::OwnerOnly,
     )?;
-    let root_acl_rules =
-        compile_acl_entry(&state, &mut catalog, &root_acl_path, &root_acl_triples)?;
+    let root_acl_rules = stage_acl_entry(
+        &state,
+        &mut staged_rdf_entries,
+        &root_acl_path,
+        root_acl_triples,
+    )?;
     compiled_wac_batches.push((acl_rule_prefix(&root_acl_path), root_acl_rules));
     seeded_paths.push(root_acl_path);
 
     // 3. Profile Container `/pods/{pod_id}/profile/`
     let profile_dir_path = format!("/pods/{pod_id}/profile/");
-    store_rdf_entry(
-        &state,
-        &mut catalog,
+    stage_rdf_entry(
+        &mut staged_rdf_entries,
         &profile_dir_path,
         ResourceKind::Container,
-        &[],
+        Vec::new(),
     )?;
     seeded_paths.push(profile_dir_path);
 
@@ -433,12 +396,11 @@ pub async fn handle_provision_pod(
         card_triples.push(named_triple(&owner_webid, PIM_STORAGE_REL, &pod_root_iri)?);
         card_triples.push(named_triple(&owner_webid, LDP_INBOX_REL, &inbox_iri)?);
     }
-    store_rdf_entry(
-        &state,
-        &mut catalog,
+    stage_rdf_entry(
+        &mut staged_rdf_entries,
         &card_path,
         ResourceKind::RdfSource,
-        &card_triples,
+        card_triples,
     )?;
     seeded_paths.push(card_path.clone());
 
@@ -452,19 +414,22 @@ pub async fn handle_provision_pod(
         &owners,
         AclGrantProfile::PublicRead,
     )?;
-    let card_acl_rules =
-        compile_acl_entry(&state, &mut catalog, &card_acl_path, &card_acl_triples)?;
+    let card_acl_rules = stage_acl_entry(
+        &state,
+        &mut staged_rdf_entries,
+        &card_acl_path,
+        card_acl_triples,
+    )?;
     compiled_wac_batches.push((acl_rule_prefix(&card_acl_path), card_acl_rules));
     seeded_paths.push(card_acl_path);
 
     // 6. LDN Inbox Container `/pods/{pod_id}/inbox/` + `.acl` (Authenticated Append + Owner full)
     let inbox_path = format!("/pods/{pod_id}/inbox/");
-    store_rdf_entry(
-        &state,
-        &mut catalog,
+    stage_rdf_entry(
+        &mut staged_rdf_entries,
         &inbox_path,
         ResourceKind::Container,
-        &[],
+        Vec::new(),
     )?;
     seeded_paths.push(inbox_path);
 
@@ -477,20 +442,23 @@ pub async fn handle_provision_pod(
         &owners,
         AclGrantProfile::AuthenticatedAppendOnContainer,
     )?;
-    let inbox_acl_rules =
-        compile_acl_entry(&state, &mut catalog, &inbox_acl_path, &inbox_acl_triples)?;
+    let inbox_acl_rules = stage_acl_entry(
+        &state,
+        &mut staged_rdf_entries,
+        &inbox_acl_path,
+        inbox_acl_triples,
+    )?;
     compiled_wac_batches.push((acl_rule_prefix(&inbox_acl_path), inbox_acl_rules));
     seeded_paths.push(inbox_acl_path);
 
     // 7. Public Container `/pods/{pod_id}/public/` + `.acl` (Public Read + default + Owner full)
     let public_path = format!("/pods/{pod_id}/public/");
     let public_iri = http_iri(base_url, &public_path);
-    store_rdf_entry(
-        &state,
-        &mut catalog,
+    stage_rdf_entry(
+        &mut staged_rdf_entries,
         &public_path,
         ResourceKind::Container,
-        &[],
+        Vec::new(),
     )?;
     seeded_paths.push(public_path);
 
@@ -503,20 +471,23 @@ pub async fn handle_provision_pod(
         &owners,
         AclGrantProfile::PublicRead,
     )?;
-    let public_acl_rules =
-        compile_acl_entry(&state, &mut catalog, &public_acl_path, &public_acl_triples)?;
+    let public_acl_rules = stage_acl_entry(
+        &state,
+        &mut staged_rdf_entries,
+        &public_acl_path,
+        public_acl_triples,
+    )?;
     compiled_wac_batches.push((acl_rule_prefix(&public_acl_path), public_acl_rules));
     seeded_paths.push(public_acl_path);
 
     // 8. Private Container `/pods/{pod_id}/private/` + `.acl` (Owner-only)
     let private_path = format!("/pods/{pod_id}/private/");
     let private_iri = http_iri(base_url, &private_path);
-    store_rdf_entry(
-        &state,
-        &mut catalog,
+    stage_rdf_entry(
+        &mut staged_rdf_entries,
         &private_path,
         ResourceKind::Container,
-        &[],
+        Vec::new(),
     )?;
     seeded_paths.push(private_path);
 
@@ -529,23 +500,22 @@ pub async fn handle_provision_pod(
         &owners,
         AclGrantProfile::OwnerOnly,
     )?;
-    let private_acl_rules = compile_acl_entry(
+    let private_acl_rules = stage_acl_entry(
         &state,
-        &mut catalog,
+        &mut staged_rdf_entries,
         &private_acl_path,
-        &private_acl_triples,
+        private_acl_triples,
     )?;
     compiled_wac_batches.push((acl_rule_prefix(&private_acl_path), private_acl_rules));
     seeded_paths.push(private_acl_path);
 
     // 9. `.well-known/wolin.json` Pod & AI Agent MCP discovery manifest + `.acl`
     let wk_dir_path = format!("/pods/{pod_id}/.well-known/");
-    store_rdf_entry(
-        &state,
-        &mut catalog,
+    stage_rdf_entry(
+        &mut staged_rdf_entries,
         &wk_dir_path,
         ResourceKind::Container,
-        &[],
+        Vec::new(),
     )?;
     seeded_paths.push(wk_dir_path);
 
@@ -567,24 +537,8 @@ pub async fn handle_provision_pod(
         }
     }))
     .map_err(|e| LdpError::Internal(format!("Failed to serialize pod wolin.json: {e}")))?;
+    let wk_size_bytes = wk_payload.len() as u64;
     let wk_etag = compute_etag(&wk_payload);
-    state
-        .physical_store
-        .put_with_content_type(
-            &blob_key_for_path(&wk_doc_path),
-            wk_payload,
-            "application/json",
-        )
-        .await?;
-    catalog.entries.insert(
-        wk_doc_path.clone(),
-        LdpEntry {
-            path: wk_doc_path.clone(),
-            kind: ResourceKind::NonRdfSource,
-            content_type: "application/json".to_string(),
-            etag: wk_etag,
-        },
-    );
     seeded_paths.push(wk_doc_path.clone());
 
     let wk_acl_path = format!("{wk_doc_path}.acl");
@@ -596,12 +550,79 @@ pub async fn handle_provision_pod(
         &owners,
         AclGrantProfile::PublicRead,
     )?;
-    let wk_acl_rules = compile_acl_entry(&state, &mut catalog, &wk_acl_path, &wk_acl_triples)?;
+    let wk_acl_rules = stage_acl_entry(
+        &state,
+        &mut staged_rdf_entries,
+        &wk_acl_path,
+        wk_acl_triples,
+    )?;
     compiled_wac_batches.push((acl_rule_prefix(&wk_acl_path), wk_acl_rules));
     seeded_paths.push(wk_acl_path);
 
+    // Enforce per-pod storage quota BEFORE touching RocksDB, OpenDAL, or catalog!
+    let rdf_seed_bytes: u64 = staged_rdf_entries
+        .iter()
+        .fold(0u64, |acc, s| acc.saturating_add(s.size_bytes));
+    let total_seed_bytes = rdf_seed_bytes.saturating_add(wk_size_bytes);
+    let current_pod_bytes = catalog.pod_usage_bytes(pod_id);
+    let projected_pod_bytes =
+        state
+            .pod_stores
+            .check_quota_delta(pod_id, current_pod_bytes, 0, total_seed_bytes)?;
+
+    // Open isolated per-pod SemanticGraphStore and commit all seeded entries.
+    let pod_graph_store = state.pod_stores.get_or_open(pod_id)?;
+
+    catalog
+        .entries
+        .entry("/pods/".to_string())
+        .or_insert_with(|| LdpEntry {
+            path: "/pods/".to_string(),
+            kind: ResourceKind::Container,
+            content_type: "text/turtle".to_string(),
+            etag: compute_etag(b"/pods/"),
+            size_bytes: 0,
+        });
+
+    for item in staged_rdf_entries {
+        let graph_iri = http_iri(&state.config.base_url, &item.canonical_path);
+        pod_graph_store.replace_named_graph_triples(&graph_iri, &item.triples)?;
+        catalog.entries.insert(
+            item.canonical_path.clone(),
+            LdpEntry {
+                path: item.canonical_path,
+                kind: item.kind,
+                content_type: "text/turtle".to_string(),
+                etag: item.etag,
+                size_bytes: item.size_bytes,
+            },
+        );
+    }
+
+    state
+        .physical_store
+        .put_with_content_type(
+            &blob_key_for_path(&wk_doc_path),
+            wk_payload,
+            "application/json",
+        )
+        .await?;
+    catalog.entries.insert(
+        wk_doc_path.clone(),
+        LdpEntry {
+            path: wk_doc_path,
+            kind: ResourceKind::NonRdfSource,
+            content_type: "application/json".to_string(),
+            etag: wk_etag,
+            size_bytes: wk_size_bytes,
+        },
+    );
+
     // Commit catalog to OpenDAL physical store, then activate WAC rules in PolicyEngine.
     catalog.persist(&state.physical_store).await?;
+    state
+        .pod_stores
+        .record_pod_usage(pod_id, projected_pod_bytes);
     {
         let mut engine = state
             .policy_engine
@@ -731,46 +752,42 @@ fn build_acl_triples(
     Ok(triples)
 }
 
-fn store_rdf_entry(
-    state: &AppState,
-    catalog: &mut LdpCatalog,
+struct StagedRdfEntry {
+    canonical_path: String,
+    kind: ResourceKind,
+    triples: Vec<Triple>,
+    etag: String,
+    size_bytes: u64,
+}
+
+fn stage_rdf_entry(
+    staged: &mut Vec<StagedRdfEntry>,
     canonical_path: &str,
     kind: ResourceKind,
-    triples: &[Triple],
+    triples: Vec<Triple>,
 ) -> Result<(), LdpError> {
-    let graph_iri = http_iri(&state.config.base_url, canonical_path);
-    state
-        .graph_store
-        .replace_named_graph_triples(&graph_iri, triples)?;
-    let canonical_nt = SemanticGraphStore::serialize_triples(triples, RdfFormat::NTriples)?;
+    let canonical_nt = SemanticGraphStore::serialize_triples(&triples, RdfFormat::NTriples)?;
+    let size_bytes = canonical_nt.len() as u64;
     let etag = compute_etag(&canonical_nt);
-    catalog.entries.insert(
-        canonical_path.to_string(),
-        LdpEntry {
-            path: canonical_path.to_string(),
-            kind,
-            content_type: "text/turtle".to_string(),
-            etag,
-        },
-    );
+    staged.push(StagedRdfEntry {
+        canonical_path: canonical_path.to_string(),
+        kind,
+        triples,
+        etag,
+        size_bytes,
+    });
     Ok(())
 }
 
-fn compile_acl_entry(
+fn stage_acl_entry(
     state: &AppState,
-    catalog: &mut LdpCatalog,
+    staged: &mut Vec<StagedRdfEntry>,
     acl_canonical_path: &str,
-    triples: &[Triple],
+    triples: Vec<Triple>,
 ) -> Result<Vec<wolin_policy::WacRule>, LdpError> {
     let target = build_ldp_target_from_canonical(acl_canonical_path, &state.config.pod_uri_prefix);
-    let rules = extract_wac_rules_from_acl_triples(&state.config, &target, triples)?;
-    store_rdf_entry(
-        state,
-        catalog,
-        acl_canonical_path,
-        ResourceKind::RdfSource,
-        triples,
-    )?;
+    let rules = extract_wac_rules_from_acl_triples(&state.config, &target, &triples)?;
+    stage_rdf_entry(staged, acl_canonical_path, ResourceKind::RdfSource, triples)?;
     Ok(rules)
 }
 

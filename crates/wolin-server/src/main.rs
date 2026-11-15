@@ -95,6 +95,8 @@ async fn main() -> anyhow::Result<()> {
         .with_pod_cloud_domain(&cli_cfg.pod_cloud_domain)
         .with_oidc_options(oidc_opts)
         .with_max_body_bytes(cli_cfg.max_body_bytes)
+        .with_max_open_pods(cli_cfg.max_open_pods)
+        .with_pod_quota_bytes(cli_cfg.pod_quota_bytes)
         .with_mcp_enabled(cli_cfg.mcp_enabled);
 
     let state = match &cli_cfg.storage_dir {
