@@ -20,7 +20,10 @@ use wolin_storage::{
 };
 
 use crate::{
-    AppState, LdpConfig, auth::extract_principal_for_request, error::LdpError,
+    AppState, LdpConfig,
+    assets::{DEFAULT_ASSET_SIGNING_TTL_SECS, build_signed_asset_redirect_url},
+    auth::extract_principal_for_request,
+    error::LdpError,
     pods::extract_subdomain_pod,
 };
 
@@ -208,6 +211,7 @@ pub(crate) struct LdpTarget {
     pub(crate) acl_path: String,
     pub(crate) policy_target: ResourceUri,
     pub(crate) subdomain_ctx: Option<(String, String)>,
+    pub(crate) force_signed_download: bool,
 }
 
 impl LdpTarget {
@@ -253,7 +257,7 @@ pub async fn handle_ldp_request(
     let body = req.into_body();
 
     let principal = extract_principal_for_request(&method, &uri, &headers, &state).await?;
-    let target = parse_ldp_target(&uri, &headers, &state.config)?;
+    let target = parse_ldp_target(&method, &uri, &headers, &state.config)?;
 
     match method {
         Method::OPTIONS => handle_options(&state, &principal, &target).await,
@@ -479,6 +483,52 @@ async fn handle_get_or_head(
                 return Ok(resp);
             }
             check_if_match_get(headers, &entry.etag)?;
+
+            if !head_only
+                && let (Some(secret), Some(asset_base_url), Some(pod_id)) = (
+                    state.config.asset_signing_secret.as_deref(),
+                    state.config.asset_public_base_url.as_deref(),
+                    target_pod_id.as_deref(),
+                )
+                && (entry.size_bytes >= state.config.asset_offload_min_bytes
+                    || target.force_signed_download)
+                && let Some(resource_path) = entry.path.strip_prefix(&format!("/pods/{pod_id}"))
+                && resource_path.starts_with('/')
+                && resource_path.len() > 1
+            {
+                let now_secs = state.config.policy_clock_epoch_secs.unwrap_or_else(|| {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0)
+                });
+                let exp = now_secs.saturating_add(DEFAULT_ASSET_SIGNING_TTL_SECS);
+                let signed_url = build_signed_asset_redirect_url(
+                    asset_base_url,
+                    secret,
+                    pod_id,
+                    resource_path,
+                    exp,
+                );
+                let loc_val = HeaderValue::from_str(&signed_url).map_err(|e| {
+                    LdpError::Internal(format!("Invalid signed asset redirect Location: {e}"))
+                })?;
+                let mut resp = StatusCode::FOUND.into_response();
+                attach_ldp_headers(
+                    resp.headers_mut(),
+                    state,
+                    principal,
+                    target,
+                    ResourceKind::NonRdfSource,
+                    Some(&entry.etag),
+                )?;
+                resp.headers_mut().insert(header::LOCATION, loc_val);
+                resp.headers_mut().insert(
+                    header::CACHE_CONTROL,
+                    HeaderValue::from_static("private, no-store"),
+                );
+                return Ok(resp);
+            }
 
             let blob_key = blob_key_for_path(&entry.path);
             let bytes = state.physical_store.get(&blob_key).await?;
@@ -1628,24 +1678,32 @@ fn compute_wac_allow(state: &AppState, principal: &Principal, target: &ResourceU
 }
 
 fn parse_ldp_target(
+    method: &Method,
     uri: &Uri,
     headers: &HeaderMap,
     config: &LdpConfig,
 ) -> Result<LdpTarget, LdpError> {
-    if uri.query().is_some() {
-        return Err(LdpError::BadRequest(
-            "Query parameters are not permitted on Solid LDP resource URIs".to_string(),
-        ));
-    }
+    let force_signed_download = match uri.query() {
+        None => false,
+        Some("download=signed") if *method == Method::GET => true,
+        Some(_) => {
+            return Err(LdpError::BadRequest(
+                "Query parameters are not permitted on Solid LDP resource URIs".to_string(),
+            ));
+        }
+    };
 
     if let Some((pod_id, sub_origin)) = extract_subdomain_pod(headers, uri, config)? {
         let rewritten = rewrite_subdomain_path(uri.path(), &pod_id)?;
         let mut target = parse_ldp_path_str(&rewritten, &config.pod_uri_prefix)?;
         target.subdomain_ctx = Some((pod_id, sub_origin));
+        target.force_signed_download = force_signed_download;
         return Ok(target);
     }
 
-    parse_ldp_path_str(uri.path(), &config.pod_uri_prefix)
+    let mut target = parse_ldp_path_str(uri.path(), &config.pod_uri_prefix)?;
+    target.force_signed_download = force_signed_download;
+    Ok(target)
 }
 
 fn rewrite_subdomain_path(raw_path: &str, pod_id: &str) -> Result<String, LdpError> {
@@ -1757,6 +1815,7 @@ pub(crate) fn build_ldp_target_from_canonical(canonical_path: &str, pod_prefix: 
             acl_path: "/.acl".to_string(),
             policy_target: ResourceUri(policy_uri),
             subdomain_ctx: None,
+            force_signed_download: false,
         };
     }
 
@@ -1773,6 +1832,7 @@ pub(crate) fn build_ldp_target_from_canonical(canonical_path: &str, pod_prefix: 
             acl_path: "/.acl".to_string(),
             policy_target: ResourceUri(policy_uri),
             subdomain_ctx: None,
+            force_signed_download: false,
         };
     }
 
@@ -1786,6 +1846,7 @@ pub(crate) fn build_ldp_target_from_canonical(canonical_path: &str, pod_prefix: 
             acl_path: canonical_path.to_string(),
             policy_target: ResourceUri(policy_uri),
             subdomain_ctx: None,
+            force_signed_download: false,
         };
     }
 
@@ -1799,6 +1860,7 @@ pub(crate) fn build_ldp_target_from_canonical(canonical_path: &str, pod_prefix: 
             acl_path: canonical_path.to_string(),
             policy_target: ResourceUri(policy_uri),
             subdomain_ctx: None,
+            force_signed_download: false,
         };
     }
 
@@ -1811,6 +1873,7 @@ pub(crate) fn build_ldp_target_from_canonical(canonical_path: &str, pod_prefix: 
             acl_path: format!("{canonical_path}.acl"),
             policy_target: ResourceUri(format!("{clean_prefix}{trimmed}")),
             subdomain_ctx: None,
+            force_signed_download: false,
         }
     } else {
         LdpTarget {
@@ -1820,6 +1883,7 @@ pub(crate) fn build_ldp_target_from_canonical(canonical_path: &str, pod_prefix: 
             acl_path: format!("{canonical_path}.acl"),
             policy_target: ResourceUri(format!("{clean_prefix}{canonical_path}")),
             subdomain_ctx: None,
+            force_signed_download: false,
         }
     }
 }

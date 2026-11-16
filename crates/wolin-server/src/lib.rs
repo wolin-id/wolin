@@ -1,5 +1,6 @@
 //! Wolin Server: Integrated Solid LDP + WAC/ACP + Native MCP HTTP Runtime.
 
+pub mod assets;
 pub mod auth;
 pub mod error;
 pub mod ldp;
@@ -11,6 +12,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
+pub use assets::{DEFAULT_ASSET_OFFLOAD_MIN_BYTES, DEFAULT_ASSET_SIGNING_TTL_SECS};
 use axum::{
     Router,
     extract::State,
@@ -62,6 +64,12 @@ pub struct LdpConfig {
     pub reserved_pods: BTreeSet<String>,
     /// Optional shared admin Bearer token guarding `/api/pods` provisioning and retirement.
     pub admin_token: Option<String>,
+    /// Optional shared HMAC-SHA256 secret for minting short-lived Edge/R2 asset offload URLs.
+    pub asset_signing_secret: Option<String>,
+    /// Optional Edge asset base URL (e.g. `"https://auth.wolin.id/assets"`) for `302 Found` offload.
+    pub asset_public_base_url: Option<String>,
+    /// Minimum `NonRDFSource` size in bytes before `GET` offloads via signed URL (`256 KiB` default).
+    pub asset_offload_min_bytes: u64,
 }
 
 impl Default for LdpConfig {
@@ -83,6 +91,9 @@ impl Default for LdpConfig {
             default_pod_quota_bytes: DEFAULT_POD_QUOTA_BYTES,
             reserved_pods: BTreeSet::new(),
             admin_token: None,
+            asset_signing_secret: None,
+            asset_public_base_url: None,
+            asset_offload_min_bytes: DEFAULT_ASSET_OFFLOAD_MIN_BYTES,
         }
     }
 }
@@ -166,6 +177,31 @@ impl LdpConfig {
         } else {
             Some(trimmed)
         };
+        self
+    }
+
+    pub fn with_asset_signing_secret(mut self, secret: impl Into<String>) -> Self {
+        let trimmed = secret.into().trim().to_string();
+        self.asset_signing_secret = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        };
+        self
+    }
+
+    pub fn with_asset_public_base_url(mut self, base_url: impl Into<String>) -> Self {
+        let trimmed = base_url.into().trim().trim_end_matches('/').to_string();
+        self.asset_public_base_url = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        };
+        self
+    }
+
+    pub fn with_asset_offload_min_bytes(mut self, min_bytes: u64) -> Self {
+        self.asset_offload_min_bytes = min_bytes;
         self
     }
 }
@@ -528,6 +564,8 @@ pub async fn well_known_wolin(State(state): State<Arc<AppState>>) -> Json<serde_
             "bounded_pod_lru_cache": true,
             "per_pod_storage_quota": true,
             "wac_acp_pdp": true,
+            "signed_asset_offload": state.config.asset_signing_secret.is_some()
+                && state.config.asset_public_base_url.is_some(),
             "mcp_jsonrpc": mcp_enabled,
             "mcp_sse": mcp_enabled,
             "zero_pii_projection": true,
@@ -555,6 +593,9 @@ pub struct ServerCliConfig {
     pub pod_quota_bytes: u64,
     pub reserved_pods: BTreeSet<String>,
     pub admin_token: Option<String>,
+    pub asset_signing_secret: Option<String>,
+    pub asset_public_base_url: Option<String>,
+    pub asset_offload_min_bytes: u64,
 }
 
 impl Default for ServerCliConfig {
@@ -576,6 +617,9 @@ impl Default for ServerCliConfig {
             pod_quota_bytes: DEFAULT_POD_QUOTA_BYTES,
             reserved_pods: BTreeSet::new(),
             admin_token: None,
+            asset_signing_secret: None,
+            asset_public_base_url: None,
+            asset_offload_min_bytes: DEFAULT_ASSET_OFFLOAD_MIN_BYTES,
         }
     }
 }
@@ -643,6 +687,9 @@ impl ServerCliConfig {
                --pod-quota-bytes <BYTES>          Default per-pod storage quota in bytes [env: WOLIN_DEFAULT_POD_QUOTA_BYTES] (default: 1073741824)\n  \
                --reserved-pods <CSV>              Comma-separated reserved/tombstoned pod_ids [env: WOLIN_RESERVED_PODS]\n  \
                --admin-token <TOKEN>              Shared Bearer token for /api/pods admin lifecycle [env: WOLIN_ADMIN_TOKEN]\n  \
+               --asset-signing-secret <SECRET>    HMAC-SHA256 secret for Edge/R2 asset offload [env: WOLIN_ASSET_SIGNING_SECRET]\n  \
+               --asset-public-base-url <URL>      Edge asset base URL (e.g. https://auth.wolin.id/assets) [env: WOLIN_ASSET_PUBLIC_BASE_URL]\n  \
+               --asset-offload-min-bytes <BYTES>  Min NonRDFSource bytes for 302 offload [env: WOLIN_ASSET_OFFLOAD_MIN_BYTES] (default: 262144)\n  \
                --healthcheck                      Probe local /healthz endpoint and exit 0 if healthy\n  \
                -h, --help                         Print help information\n  \
                -V, --version                      Print version information",
@@ -798,6 +845,23 @@ impl ServerCliConfig {
                     }
                     cfg.admin_token = Some(val.trim().to_string());
                 }
+                "--asset-signing-secret" => {
+                    let val = take_val(inline_val, &mut iter, "--asset-signing-secret")?;
+                    if val.trim().is_empty() {
+                        return Err("--asset-signing-secret must not be empty".to_string());
+                    }
+                    cfg.asset_signing_secret = Some(val.trim().to_string());
+                }
+                "--asset-public-base-url" => {
+                    let val = take_val(inline_val, &mut iter, "--asset-public-base-url")?;
+                    cfg.asset_public_base_url =
+                        Some(parse_base_url(&val, "--asset-public-base-url")?);
+                }
+                "--asset-offload-min-bytes" => {
+                    let val = take_val(inline_val, &mut iter, "--asset-offload-min-bytes")?;
+                    cfg.asset_offload_min_bytes =
+                        parse_asset_offload_min_bytes(&val, "--asset-offload-min-bytes")?;
+                }
                 unknown => {
                     return Err(format!(
                         "Unknown CLI flag '{unknown}'. Run with --help for usage."
@@ -870,6 +934,16 @@ impl ServerCliConfig {
         }
         if let Some(val) = non_empty_env(get_env, "WOLIN_ADMIN_TOKEN") {
             self.admin_token = Some(val);
+        }
+        if let Some(val) = non_empty_env(get_env, "WOLIN_ASSET_SIGNING_SECRET") {
+            self.asset_signing_secret = Some(val);
+        }
+        if let Some(val) = non_empty_env(get_env, "WOLIN_ASSET_PUBLIC_BASE_URL") {
+            self.asset_public_base_url = Some(parse_base_url(&val, "WOLIN_ASSET_PUBLIC_BASE_URL")?);
+        }
+        if let Some(val) = non_empty_env(get_env, "WOLIN_ASSET_OFFLOAD_MIN_BYTES") {
+            self.asset_offload_min_bytes =
+                parse_asset_offload_min_bytes(&val, "WOLIN_ASSET_OFFLOAD_MIN_BYTES")?;
         }
         Ok(())
     }
@@ -1024,6 +1098,12 @@ fn parse_pod_quota_bytes(val: &str, source: &str) -> Result<u64, String> {
         return Err(format!("{source} must be greater than 0"));
     }
     Ok(parsed)
+}
+
+fn parse_asset_offload_min_bytes(val: &str, source: &str) -> Result<u64, String> {
+    val.trim()
+        .parse::<u64>()
+        .map_err(|_| format!("Invalid integer for {source}: '{val}'"))
 }
 
 fn parse_reserved_pods(
@@ -1734,6 +1814,86 @@ mod tests {
                 })
                 .is_err(),
                 "expected WOLIN_RESERVED_PODS='{bad_csv}' to fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn unit_asset_offload_cli_and_env_parsing() {
+        let CliParseOutcome::Run(defaults) =
+            ServerCliConfig::parse_from(["wolin-server"]).expect("default parse")
+        else {
+            panic!("expected Run");
+        };
+        assert!(defaults.asset_signing_secret.is_none());
+        assert!(defaults.asset_public_base_url.is_none());
+        assert_eq!(defaults.asset_offload_min_bytes, 262_144);
+
+        let CliParseOutcome::Run(from_env) =
+            ServerCliConfig::parse_from_with_env(["wolin-server"], |k| match k {
+                "WOLIN_ASSET_SIGNING_SECRET" => Some("edge-secret-123".to_string()),
+                "WOLIN_ASSET_PUBLIC_BASE_URL" => Some("https://auth.wolin.id/assets/".to_string()),
+                "WOLIN_ASSET_OFFLOAD_MIN_BYTES" => Some("524288".to_string()),
+                _ => None,
+            })
+            .expect("asset env parse")
+        else {
+            panic!("expected Run");
+        };
+        assert_eq!(
+            from_env.asset_signing_secret.as_deref(),
+            Some("edge-secret-123")
+        );
+        assert_eq!(
+            from_env.asset_public_base_url.as_deref(),
+            Some("https://auth.wolin.id/assets")
+        );
+        assert_eq!(from_env.asset_offload_min_bytes, 524_288);
+
+        let CliParseOutcome::Run(cli_override) = ServerCliConfig::parse_from_with_env(
+            [
+                "wolin-server",
+                "--asset-signing-secret",
+                "cli-secret-456",
+                "--asset-public-base-url=https://cdn.wolin.id/assets/",
+                "--asset-offload-min-bytes",
+                "0",
+            ],
+            |k| match k {
+                "WOLIN_ASSET_SIGNING_SECRET" => Some("edge-secret-123".to_string()),
+                "WOLIN_ASSET_PUBLIC_BASE_URL" => Some("https://auth.wolin.id/assets".to_string()),
+                "WOLIN_ASSET_OFFLOAD_MIN_BYTES" => Some("524288".to_string()),
+                _ => None,
+            },
+        )
+        .expect("asset CLI override") else {
+            panic!("expected Run");
+        };
+        assert_eq!(
+            cli_override.asset_signing_secret.as_deref(),
+            Some("cli-secret-456")
+        );
+        assert_eq!(
+            cli_override.asset_public_base_url.as_deref(),
+            Some("https://cdn.wolin.id/assets")
+        );
+        assert_eq!(cli_override.asset_offload_min_bytes, 0);
+
+        for (bad_env, bad_val) in [
+            ("WOLIN_ASSET_PUBLIC_BASE_URL", "ftp://bad.example/assets"),
+            (
+                "WOLIN_ASSET_PUBLIC_BASE_URL",
+                "https://auth.wolin.id/assets?x=1",
+            ),
+            ("WOLIN_ASSET_OFFLOAD_MIN_BYTES", "-1"),
+            ("WOLIN_ASSET_OFFLOAD_MIN_BYTES", "notanumber"),
+        ] {
+            assert!(
+                ServerCliConfig::parse_from_with_env(["wolin-server"], |k| {
+                    (k == bad_env).then(|| bad_val.to_string())
+                })
+                .is_err(),
+                "expected {bad_env}={bad_val} to fail closed"
             );
         }
     }

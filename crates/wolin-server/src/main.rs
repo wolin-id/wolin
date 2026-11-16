@@ -98,9 +98,16 @@ async fn main() -> anyhow::Result<()> {
         .with_max_open_pods(cli_cfg.max_open_pods)
         .with_pod_quota_bytes(cli_cfg.pod_quota_bytes)
         .with_reserved_pods(cli_cfg.reserved_pods.iter().cloned())
-        .with_mcp_enabled(cli_cfg.mcp_enabled);
+        .with_mcp_enabled(cli_cfg.mcp_enabled)
+        .with_asset_offload_min_bytes(cli_cfg.asset_offload_min_bytes);
     if let Some(ref token) = cli_cfg.admin_token {
         ldp_config = ldp_config.with_admin_token(token);
+    }
+    if let Some(ref secret) = cli_cfg.asset_signing_secret {
+        ldp_config = ldp_config.with_asset_signing_secret(secret);
+    }
+    if let Some(ref asset_base) = cli_cfg.asset_public_base_url {
+        ldp_config = ldp_config.with_asset_public_base_url(asset_base);
     }
 
     let state = match &cli_cfg.storage_dir {
