@@ -14,25 +14,188 @@ pub const DEFAULT_MAX_OPEN_PODS: usize = 256;
 /// Default per-pod logical storage quota in bytes (`1 GiB`).
 pub const DEFAULT_POD_QUOTA_BYTES: u64 = 1024 * 1024 * 1024;
 
-const MAX_POD_ID_LEN: usize = 63;
+/// Minimum allowed length for a tenant `pod_id` subdomain label.
+pub const MIN_POD_ID_LEN: usize = 3;
+
+/// Maximum allowed length for a tenant `pod_id` subdomain label.
+pub const MAX_POD_ID_LEN: usize = 32;
+
 const ROCKSDB_MAX_OPEN_FILES_PER_POD: u32 = 64;
 
-const RESERVED_POD_IDS: &[&str] = &[
-    "pod",
-    "pods",
+/// Canonical sorted reserved-word blocklist shared identically between
+/// `wolin-cloud` and `wolin-engine` (infrastructure, RFC 2142, DNS, mail,
+/// OAuth/OIDC, Solid LDP/MCP, and brand/trust handles).
+pub const RESERVED_POD_IDS: &[&str] = &[
+    "abuse",
+    "admin",
+    "administrator",
+    "ads",
     "api",
+    "app",
+    "apps",
+    "assets",
     "auth",
-    "login",
-    "id",
-    "www",
-    "mcp",
+    "authorize",
+    "autoconfig",
+    "autodiscover",
+    "backup",
+    "beta",
+    "billing",
+    "blog",
+    "calendar",
+    "cdn",
+    "chat",
+    "cloud",
+    "consent",
+    "console",
+    "contact",
+    "control",
+    "corp",
+    "dashboard",
+    "data",
+    "dev",
+    "dns",
+    "doc",
+    "docs",
+    "download",
+    "downloads",
+    "edge",
+    "email",
+    "engine",
+    "enterprise",
+    "entropy",
+    "events",
+    "files",
+    "forum",
+    "ftp",
+    "gateway",
+    "git",
+    "graphql",
     "health",
     "healthz",
-    "public",
+    "help",
+    "home",
+    "host",
+    "hostmaster",
+    "id",
+    "idp",
+    "images",
+    "imap",
+    "img",
+    "inbox",
+    "info",
+    "internal",
+    "jwks",
+    "legal",
+    "local",
+    "localhost",
+    "login",
+    "logout",
+    "logs",
+    "mail",
+    "mailer",
+    "manage",
+    "mcp",
+    "media",
+    "metrics",
+    "mta-sts",
+    "mx",
+    "net",
+    "news",
+    "no-reply",
+    "noreply",
+    "notify",
+    "ns",
+    "ns1",
+    "ns2",
+    "ns3",
+    "ns4",
+    "oauth",
+    "official",
+    "oidc",
+    "ops",
+    "org",
+    "origin",
+    "passport",
+    "pay",
+    "payment",
+    "payments",
+    "pod",
+    "pods",
+    "pop",
+    "pop3",
+    "portal",
+    "postmaster",
+    "press",
+    "pricing",
     "private",
-    "admin",
+    "prod",
+    "production",
+    "profile",
+    "proxy",
+    "pub",
+    "public",
+    "register",
+    "registry",
+    "relay",
+    "root",
+    "rpc",
+    "rss",
+    "sandbox",
+    "search",
+    "secure",
+    "security",
+    "server",
+    "service",
+    "services",
+    "session",
+    "settings",
+    "sftp",
+    "signin",
+    "signout",
+    "signup",
+    "smtp",
+    "solid",
+    "sparql",
+    "ssh",
+    "sso",
+    "stage",
+    "staging",
+    "static",
+    "stats",
+    "status",
+    "storage",
+    "store",
+    "support",
+    "sync",
+    "sys",
     "system",
+    "team",
+    "telemetry",
+    "terms",
+    "test",
+    "testing",
+    "token",
+    "trust",
+    "updates",
+    "upload",
+    "uploads",
+    "userinfo",
+    "vault",
+    "verify",
+    "vpn",
+    "wac",
+    "web",
+    "webhook",
+    "webhooks",
+    "webid",
+    "webmail",
+    "webmaster",
     "well-known",
+    "wolin",
+    "ws",
+    "wss",
+    "www",
 ];
 
 enum PodBackend {
@@ -291,12 +454,13 @@ impl PodStoreManager {
         }
     }
 
-    /// Validate that `pod_id` is a safe RFC 1123 lowercase DNS label (`[a-z0-9-]`, 1..=63 chars)
-    /// and does not collide with reserved infrastructure/system routes or path traversal segments.
-    pub fn validate_pod_id(pod_id: &str) -> Result<()> {
-        if pod_id.is_empty() || pod_id.len() > MAX_POD_ID_LEN {
+    /// Validate legacy-compatible pod directory segment (`1..=63` lowercase ASCII `[a-z0-9-]`,
+    /// no leading/trailing `'-'`, not starting with `"__wolin_"`) for retiring or purging
+    /// pre-existing storage directories without path traversal risk.
+    pub fn validate_legacy_pod_segment(pod_id: &str) -> Result<()> {
+        if pod_id.is_empty() || pod_id.len() > 63 {
             return Err(WolinError::InvalidFormat(
-                "pod_id must be between 1 and 63 lowercase characters".to_string(),
+                "pod_id segment must be between 1 and 63 lowercase characters".to_string(),
             ));
         }
         if pod_id.starts_with('-')
@@ -307,11 +471,46 @@ impl PodStoreManager {
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
         {
             return Err(WolinError::InvalidFormat(
+                "pod_id segment must contain only lowercase ASCII letters, digits, or interior hyphens"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validate syntactic constraints on `pod_id` (`3..=32` chars, lowercase ASCII `[a-z0-9-]`,
+    /// starts and ends with `[a-z0-9]`, and no consecutive hyphens `'--'`).
+    pub fn validate_pod_id_syntax(pod_id: &str) -> Result<()> {
+        if pod_id.len() < MIN_POD_ID_LEN || pod_id.len() > MAX_POD_ID_LEN {
+            return Err(WolinError::InvalidFormat(format!(
+                "pod_id must be between {MIN_POD_ID_LEN} and {MAX_POD_ID_LEN} lowercase characters"
+            )));
+        }
+        if pod_id.starts_with('-')
+            || pod_id.ends_with('-')
+            || !pod_id
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        {
+            return Err(WolinError::InvalidFormat(
                 "pod_id must contain only lowercase ASCII letters, digits, or interior hyphens"
                     .to_string(),
             ));
         }
-        if RESERVED_POD_IDS.contains(&pod_id) {
+        if pod_id.contains("--") {
+            return Err(WolinError::InvalidFormat(
+                "pod_id must not contain consecutive hyphens ('--')".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validate that `pod_id` is a safe lowercase DNS label (`3..=32` chars, `[a-z0-9-]`,
+    /// starts and ends with `[a-z0-9]`, no consecutive hyphens `'--'`) and does not collide
+    /// with reserved infrastructure/system routes or path traversal segments.
+    pub fn validate_pod_id(pod_id: &str) -> Result<()> {
+        Self::validate_pod_id_syntax(pod_id)?;
+        if RESERVED_POD_IDS.binary_search(&pod_id).is_ok() {
             return Err(WolinError::InvalidFormat(format!(
                 "pod_id '{pod_id}' is reserved for system infrastructure"
             )));
@@ -480,6 +679,53 @@ impl PodStoreManager {
             PodBackend::InMemory => Ok(None),
             PodBackend::Persistent { storage_root } => {
                 Ok(Some(storage_root.join("pods").join(pod_id).join("graph")))
+            }
+        }
+    }
+
+    /// Evict `pod_id` from hot/cold caches, clear its quota/usage counters, and remove its
+    /// isolated RocksDB directory (`storage_dir/pods/{pod_id}`) when running persistently.
+    pub fn purge_pod_storage(&self, pod_id: &str) -> Result<()> {
+        Self::validate_legacy_pod_segment(pod_id)?;
+
+        let (evicted_store, pod_gate) = {
+            let mut guard = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let open = guard.open_pods.remove(pod_id);
+            if let Some(pos) = guard.lru_order.iter().position(|id| id == pod_id) {
+                guard.lru_order.remove(pos);
+            }
+            guard.cold_memory_stores.remove(pod_id);
+            guard.in_flight_evicted.remove(pod_id);
+            guard.pod_usage_bytes.remove(pod_id);
+            guard.pod_quota_overrides.remove(pod_id);
+            let gate = guard.lifecycle_gates.remove(pod_id);
+            (open, gate)
+        };
+
+        match &self.inner.backend {
+            PodBackend::InMemory => {
+                drop(evicted_store);
+                Ok(())
+            }
+            PodBackend::Persistent { storage_root } => {
+                let _gate_guard = pod_gate
+                    .as_ref()
+                    .map(|g| g.lock().unwrap_or_else(|e| e.into_inner()));
+                drop(evicted_store);
+                let pod_dir = storage_root.join("pods").join(pod_id);
+                if pod_dir.exists() {
+                    std::fs::remove_dir_all(&pod_dir).map_err(|e| {
+                        WolinError::Storage(format!(
+                            "Failed to remove retired pod directory {:?}: {e}",
+                            pod_dir
+                        ))
+                    })?;
+                }
+                Ok(())
             }
         }
     }
@@ -1067,6 +1313,121 @@ mod tests {
             for t in race_threads {
                 t.join().expect("race thread panicked");
             }
+        }
+    }
+
+    #[test]
+    fn unit_pod_id_security_constraints_and_reserved_blocklist() {
+        assert_eq!(MIN_POD_ID_LEN, 3);
+        assert_eq!(MAX_POD_ID_LEN, 32);
+
+        // Strictly sorted alphabetically with zero duplicates
+        for pair in RESERVED_POD_IDS.windows(2) {
+            assert!(
+                pair[0] < pair[1],
+                "RESERVED_POD_IDS must be strictly sorted: '{}' >= '{}'",
+                pair[0],
+                pair[1]
+            );
+        }
+
+        // Valid boundary & interior single-hyphen handles
+        let max_valid = "a".repeat(32);
+        let max_hyphenated = format!("a1-{}", "b".repeat(29));
+        for valid in [
+            "abc",
+            "bob",
+            "a-1",
+            "alice-01",
+            "sovereign-user-2026",
+            max_valid.as_str(),
+            max_hyphenated.as_str(),
+        ] {
+            assert!(
+                PodStoreManager::validate_pod_id(valid).is_ok(),
+                "expected '{valid}' to be accepted"
+            );
+        }
+
+        // Invalid lengths (< 3 or > 32), leading/trailing '-', consecutive '--', punycode 'xn--', non-[a-z0-9-]
+        let too_long_33 = "a".repeat(33);
+        let too_long_63 = "a".repeat(63);
+        for bad in [
+            "",
+            "a",
+            "ab",
+            "42",
+            too_long_33.as_str(),
+            too_long_63.as_str(),
+            "-abc",
+            "abc-",
+            "---",
+            "ab--cd",
+            "foo--bar",
+            "xn--pple-43d",
+            "xn--80akhbyknj4f",
+            "Alice",
+            "ALICE",
+            "my_pod",
+            "__wolin_internal",
+            "sub.domain",
+            "../etc",
+        ] {
+            assert!(
+                PodStoreManager::validate_pod_id(bad).is_err(),
+                "expected malformed pod_id '{bad}' to be rejected"
+            );
+        }
+
+        // Shared comprehensive reserved-word blocklist
+        for reserved in [
+            "www",
+            "api",
+            "auth",
+            "pod",
+            "pods",
+            "app",
+            "docs",
+            "ads",
+            "mail",
+            "smtp",
+            "imap",
+            "pop",
+            "ftp",
+            "admin",
+            "root",
+            "support",
+            "help",
+            "billing",
+            "pay",
+            "status",
+            "health",
+            "healthz",
+            "cdn",
+            "static",
+            "assets",
+            "ns1",
+            "ns2",
+            "dev",
+            "staging",
+            "test",
+            "wolin",
+            "entropy",
+            "enterprise",
+            "official",
+            "security",
+            "abuse",
+            "postmaster",
+            "webmaster",
+            "hostmaster",
+            "noreply",
+            "no-reply",
+            "well-known",
+        ] {
+            assert!(
+                PodStoreManager::validate_pod_id(reserved).is_err(),
+                "expected reserved pod_id '{reserved}' to be rejected"
+            );
         }
     }
 }

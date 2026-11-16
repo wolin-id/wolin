@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -66,6 +67,7 @@ pub struct McpGatewayConfig {
     pub max_message_bytes: usize,
     pub max_resource_bytes: usize,
     pub policy_clock_epoch_secs: Option<i64>,
+    pub reserved_pods: BTreeSet<String>,
 }
 
 impl Default for McpGatewayConfig {
@@ -76,6 +78,7 @@ impl Default for McpGatewayConfig {
             max_message_bytes: DEFAULT_MAX_MESSAGE_BYTES,
             max_resource_bytes: DEFAULT_MAX_RESOURCE_BYTES,
             policy_clock_epoch_secs: None,
+            reserved_pods: BTreeSet::new(),
         }
     }
 }
@@ -101,6 +104,19 @@ impl McpGatewayConfig {
 
     pub fn with_max_resource_bytes(mut self, max_bytes: usize) -> Self {
         self.max_resource_bytes = max_bytes;
+        self
+    }
+
+    pub fn with_reserved_pods<I, S>(mut self, pods: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.reserved_pods = pods
+            .into_iter()
+            .map(|s| s.into().trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
         self
     }
 }
@@ -209,6 +225,22 @@ impl McpAgentServer {
             *guard = policy;
         }
         self
+    }
+
+    fn is_canonical_pod_blocked(&self, catalog: &PodCatalog, canonical_path: &str) -> bool {
+        let Some(rest) = canonical_path.strip_prefix("/pods/") else {
+            return false;
+        };
+        let seg = match rest.split_once('/') {
+            Some((pod_id, _)) => pod_id,
+            None => rest,
+        };
+        if seg.is_empty() {
+            return false;
+        }
+        PodStoreManager::validate_pod_id(seg).is_err()
+            || self.config.reserved_pods.contains(seg)
+            || catalog.tombstones.contains_key(seg)
     }
 
     pub fn with_policy_mut<R>(&self, f: impl FnOnce(&mut PolicyEngine) -> R) -> R {
@@ -599,7 +631,7 @@ impl McpAgentServer {
         let mut first_deny_reason: Option<String> = None;
 
         for (key, entry) in &catalog.entries {
-            if key.ends_with(".acl") {
+            if key.ends_with(".acl") || self.is_canonical_pod_blocked(&catalog, key) {
                 continue;
             }
             let Ok(resolved) =
@@ -749,6 +781,13 @@ impl McpAgentServer {
         let catalog = PodCatalog::load_or_init(&self.physical_store)
             .await
             .map_err(|e| JsonRpcErrorObject::new(INTERNAL_ERROR, e.to_string()))?;
+
+        if self.is_canonical_pod_blocked(&catalog, &resolved.canonical_path) {
+            return Err(JsonRpcErrorObject::new(
+                RESOURCE_NOT_FOUND_ERROR,
+                format!("Pod resource '{}' not found", resolved.display_uri),
+            ));
+        }
 
         let Some(entry) = catalog.entries.get(&resolved.catalog_key).cloned() else {
             return Err(JsonRpcErrorObject::new(
@@ -1200,6 +1239,12 @@ impl McpAgentServer {
                         "Access denied: '.acl' governance graphs cannot be queried via wolin_query_semantic",
                     );
                 }
+                if self.is_canonical_pod_blocked(&catalog, &resolved.canonical_path) {
+                    return McpToolResult::err_text(format!(
+                        "Pod resource '{}' not found",
+                        resolved.display_uri
+                    ));
+                }
                 // Upgrade container path without trailing `/` when registered as a Container in PodCatalog
                 if !resolved.is_container {
                     let container_candidate = format!("{}/", resolved.catalog_key);
@@ -1243,6 +1288,7 @@ impl McpAgentServer {
         // 1. Project PDP-permitted Cataloged Named Graphs (deterministic sorted BTreeMap order)
         for (catalog_key, entry) in &catalog.entries {
             if catalog_key.ends_with(".acl")
+                || self.is_canonical_pod_blocked(&catalog, catalog_key)
                 || !matches!(
                     entry.kind,
                     ResourceKind::RdfSource | ResourceKind::Container
@@ -1571,6 +1617,13 @@ impl McpAgentServer {
             Err(e) => return McpToolResult::err_text(e.to_string()),
         };
 
+        if self.is_canonical_pod_blocked(&catalog, &resolved.canonical_path) {
+            return McpToolResult::err_text(format!(
+                "Pod resource '{}' not found",
+                resolved.display_uri
+            ));
+        }
+
         let Some(entry) = catalog.entries.get(&resolved.catalog_key).cloned() else {
             return McpToolResult::err_text(format!(
                 "Pod resource '{}' not found",
@@ -1888,6 +1941,15 @@ impl McpAgentServer {
             Err(e) => return McpToolResult::err_text(e.to_string()),
         };
 
+        if let Some(ref pod_id) = target_pod_id
+            && (self.config.reserved_pods.contains(pod_id)
+                || catalog.tombstones.contains_key(pod_id))
+        {
+            return McpToolResult::err_text(format!(
+                "Pod '{pod_id}' is reserved or retired and cannot be modified"
+            ));
+        }
+
         let existing = catalog.entries.get(&resolved.catalog_key).cloned();
         if let Some(expected_etag) = if_match_opt {
             let trimmed = expected_etag.trim();
@@ -2136,6 +2198,13 @@ impl McpAgentServer {
             Ok(c) => c,
             Err(e) => return McpToolResult::err_text(e.to_string()),
         };
+
+        if self.is_canonical_pod_blocked(&catalog, &resolved.canonical_path) {
+            return McpToolResult::err_text(format!(
+                "Target Pod container '{}' not found",
+                resolved.display_uri
+            ));
+        }
 
         match catalog.entries.get(&resolved.catalog_key) {
             Some(entry) if entry.kind == ResourceKind::Container => {}

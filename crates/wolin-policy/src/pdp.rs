@@ -125,6 +125,36 @@ impl PolicyEngine {
         before - self.wac_rules.len()
     }
 
+    /// Purge all WAC rules, ACP policies, delegation grants, and WebID-issuer bindings
+    /// associated with a retired Pod (`pod_resource_prefix` e.g. `"wolin://pod/pods/alice/"`).
+    pub fn purge_pod_governance(
+        &mut self,
+        pod_resource_prefix: &str,
+        acl_doc_prefix: &str,
+        pod_webids: &[&str],
+    ) {
+        let bare_pod_uri = pod_resource_prefix.trim_end_matches('/');
+        let matches_pod_uri =
+            |u: &ResourceUri| u.0 == bare_pod_uri || u.0.starts_with(pod_resource_prefix);
+
+        self.wac_rules.retain(|r| {
+            !r.id.starts_with(acl_doc_prefix)
+                && !r.access_to.iter().any(matches_pod_uri)
+                && !r.default_for.iter().any(matches_pod_uri)
+        });
+        self.acp_policies.retain(|p| {
+            !p.targets.iter().any(matches_pod_uri)
+                && !p.inherited_containers.iter().any(matches_pod_uri)
+        });
+        self.delegation_grants.retain(|g| {
+            !pod_webids.contains(&g.delegated_by.0.as_str())
+                && !g.resource_scopes.iter().any(matches_pod_uri)
+        });
+        for webid in pod_webids {
+            self.webid_issuers.remove(&WebId((*webid).to_string()));
+        }
+    }
+
     pub fn add_acp_policy(&mut self, policy: AcpPolicy) {
         if policy.all_of.is_empty() && policy.any_of.is_empty() {
             warn!(

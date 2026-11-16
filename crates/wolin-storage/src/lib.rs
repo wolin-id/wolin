@@ -14,5 +14,6 @@ pub use oxigraph::model as rdf_model;
 pub use oxigraph::sparql as rdf_sparql;
 pub use physical::{BlobMetadata, PhysicalStore};
 pub use pod_manager::{
-    DEFAULT_MAX_OPEN_PODS, DEFAULT_POD_QUOTA_BYTES, PodGraphHandle, PodStoreManager,
+    DEFAULT_MAX_OPEN_PODS, DEFAULT_POD_QUOTA_BYTES, MAX_POD_ID_LEN, MIN_POD_ID_LEN, PodGraphHandle,
+    PodStoreManager, RESERVED_POD_IDS,
 };

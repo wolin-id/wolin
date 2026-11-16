@@ -19,10 +19,19 @@ pub struct CatalogEntry {
     pub size_bytes: u64,
 }
 
+/// Tombstone entry wire-compatible with `wolin-server`'s `PodTombstone`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogTombstone {
+    pub reason: String,
+    pub retired_at: i64,
+}
+
 /// Persistent Solid Pod catalog stored at `__wolin_meta/catalog.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PodCatalog {
     pub entries: BTreeMap<String, CatalogEntry>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tombstones: BTreeMap<String, CatalogTombstone>,
 }
 
 impl Default for PodCatalog {
@@ -38,7 +47,10 @@ impl Default for PodCatalog {
                 size_bytes: 0,
             },
         );
-        Self { entries }
+        Self {
+            entries,
+            tombstones: BTreeMap::new(),
+        }
     }
 }
 

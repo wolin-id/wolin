@@ -91,13 +91,17 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let base_url = cli_cfg.effective_base_url();
-    let ldp_config = LdpConfig::new(&base_url, &cli_cfg.pod_uri_prefix)
+    let mut ldp_config = LdpConfig::new(&base_url, &cli_cfg.pod_uri_prefix)
         .with_pod_cloud_domain(&cli_cfg.pod_cloud_domain)
         .with_oidc_options(oidc_opts)
         .with_max_body_bytes(cli_cfg.max_body_bytes)
         .with_max_open_pods(cli_cfg.max_open_pods)
         .with_pod_quota_bytes(cli_cfg.pod_quota_bytes)
+        .with_reserved_pods(cli_cfg.reserved_pods.iter().cloned())
         .with_mcp_enabled(cli_cfg.mcp_enabled);
+    if let Some(ref token) = cli_cfg.admin_token {
+        ldp_config = ldp_config.with_admin_token(token);
+    }
 
     let state = match &cli_cfg.storage_dir {
         Some(dir) => {

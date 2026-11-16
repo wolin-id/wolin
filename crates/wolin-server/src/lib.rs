@@ -6,6 +6,7 @@ pub mod ldp;
 pub mod mcp;
 pub mod pods;
 
+use std::collections::BTreeSet;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -57,6 +58,10 @@ pub struct LdpConfig {
     pub max_open_pods: usize,
     /// Default logical storage quota in bytes per tenant Pod (`1 GiB` default).
     pub default_pod_quota_bytes: u64,
+    /// Operator-configured reserved/tombstoned `pod_id` handles blocked on `POST /api/pods`.
+    pub reserved_pods: BTreeSet<String>,
+    /// Optional shared admin Bearer token guarding `/api/pods` provisioning and retirement.
+    pub admin_token: Option<String>,
 }
 
 impl Default for LdpConfig {
@@ -76,6 +81,8 @@ impl Default for LdpConfig {
             mcp_enabled: true,
             max_open_pods: DEFAULT_MAX_OPEN_PODS,
             default_pod_quota_bytes: DEFAULT_POD_QUOTA_BYTES,
+            reserved_pods: BTreeSet::new(),
+            admin_token: None,
         }
     }
 }
@@ -138,6 +145,29 @@ impl LdpConfig {
         self.default_pod_quota_bytes = quota_bytes;
         self
     }
+
+    pub fn with_reserved_pods<I, S>(mut self, pods: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.reserved_pods = pods
+            .into_iter()
+            .map(|s| s.into().trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        self
+    }
+
+    pub fn with_admin_token(mut self, token: impl Into<String>) -> Self {
+        let trimmed = token.into().trim().to_string();
+        self.admin_token = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        };
+        self
+    }
 }
 
 /// Shared application state across Axum Solid LDP, Native MCP, and system discovery endpoints.
@@ -196,7 +226,8 @@ impl AppState {
         let catalog_lock = Arc::new(tokio::sync::RwLock::new(()));
 
         let mut mcp_config = McpGatewayConfig::new(&config.base_url, &config.pod_uri_prefix)
-            .with_max_resource_bytes(config.max_body_bytes);
+            .with_max_resource_bytes(config.max_body_bytes)
+            .with_reserved_pods(config.reserved_pods.iter().cloned());
         if let Some(ts) = config.policy_clock_epoch_secs {
             mcp_config = mcp_config.with_policy_clock(ts);
         }
@@ -302,6 +333,91 @@ impl AppState {
         *cat_guard = fresh;
         Ok(())
     }
+
+    /// Permanently retire `pod_id` into the persistent LDP tombstone ledger, removing its
+    /// catalog entries, physical blobs, per-pod RocksDB store, and governance policies so
+    /// it can never be re-claimed or read/written.
+    pub async fn retire_pod(
+        &self,
+        pod_id: &str,
+        reason: &str,
+        retired_at: i64,
+    ) -> Result<ldp::PodTombstone, error::LdpError> {
+        let clean_pod_id = pod_id.trim().to_ascii_lowercase();
+        PodStoreManager::validate_legacy_pod_segment(&clean_pod_id)?;
+
+        let clean_reason = reason.trim();
+        if clean_reason.is_empty() || clean_reason.len() > 512 {
+            return Err(error::LdpError::BadRequest(
+                "Tombstone retirement reason must be between 1 and 512 characters".to_string(),
+            ));
+        }
+
+        let _io_guard = self.catalog_lock.write().await;
+        let mut catalog = self.catalog.write().await;
+        *catalog = LdpCatalog::load_or_init(&self.physical_store).await?;
+
+        let tombstone = catalog
+            .tombstones
+            .entry(clean_pod_id.clone())
+            .or_insert_with(|| ldp::PodTombstone {
+                reason: clean_reason.to_string(),
+                retired_at,
+            })
+            .clone();
+
+        let pod_prefix = format!("/pods/{clean_pod_id}/");
+        let removed_paths: Vec<(String, wolin_core::ResourceKind)> = catalog
+            .entries
+            .keys()
+            .filter(|k| k.starts_with(&pod_prefix))
+            .filter_map(|k| catalog.entries.get(k).map(|e| (k.clone(), e.kind)))
+            .collect();
+
+        for (path, kind) in &removed_paths {
+            if *kind == wolin_core::ResourceKind::NonRdfSource {
+                self.physical_store
+                    .delete(&ldp::blob_key_for_path(path))
+                    .await?;
+            }
+            catalog.entries.remove(path);
+        }
+
+        self.pod_stores.purge_pod_storage(&clean_pod_id)?;
+        catalog.persist(&self.physical_store).await?;
+
+        let base = self.config.base_url.trim_end_matches('/');
+        let path_webid = format!("{base}/pods/{clean_pod_id}/profile/card#me");
+        let mut pod_webids = vec![path_webid];
+        if !self.config.pod_cloud_domain.is_empty() {
+            pod_webids.push(format!(
+                "https://{clean_pod_id}.{}/profile/card#me",
+                self.config.pod_cloud_domain
+            ));
+            pod_webids.push(format!(
+                "http://{clean_pod_id}.{}/profile/card#me",
+                self.config.pod_cloud_domain
+            ));
+        }
+        let pod_webid_refs: Vec<&str> = pod_webids.iter().map(String::as_str).collect();
+        let pod_resource_prefix = format!(
+            "{}/pods/{clean_pod_id}/",
+            self.config.pod_uri_prefix.trim_end_matches('/')
+        );
+        {
+            let mut engine = self
+                .policy_engine
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            engine.purge_pod_governance(
+                &pod_resource_prefix,
+                &format!("acl-doc:{pod_prefix}"),
+                &pod_webid_refs,
+            );
+        }
+
+        Ok(tombstone)
+    }
 }
 
 fn ensure_private_dir(path: &Path) -> wolin_core::Result<()> {
@@ -332,7 +448,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/healthz", get(health_check))
         .route("/.well-known/wolin", get(well_known_wolin))
         .route("/api/pods", post(pods::handle_provision_pod))
-        .route("/api/pods/{pod_id}", get(pods::handle_get_pod_info));
+        .route(
+            "/api/pods/{pod_id}",
+            get(pods::handle_get_pod_info).delete(pods::handle_retire_pod),
+        );
 
     router = if state.config.mcp_enabled {
         router
@@ -434,6 +553,8 @@ pub struct ServerCliConfig {
     pub max_body_bytes: usize,
     pub max_open_pods: usize,
     pub pod_quota_bytes: u64,
+    pub reserved_pods: BTreeSet<String>,
+    pub admin_token: Option<String>,
 }
 
 impl Default for ServerCliConfig {
@@ -453,6 +574,8 @@ impl Default for ServerCliConfig {
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             max_open_pods: DEFAULT_MAX_OPEN_PODS,
             pod_quota_bytes: DEFAULT_POD_QUOTA_BYTES,
+            reserved_pods: BTreeSet::new(),
+            admin_token: None,
         }
     }
 }
@@ -518,6 +641,8 @@ impl ServerCliConfig {
                --max-body-bytes <BYTES>           Maximum HTTP payload bytes [env: WOLIN_MAX_BODY_BYTES] (default: 16777216)\n  \
                --max-open-pods <COUNT>            Max open per-pod RocksDB stores [env: WOLIN_MAX_OPEN_PODS] (default: 256)\n  \
                --pod-quota-bytes <BYTES>          Default per-pod storage quota in bytes [env: WOLIN_DEFAULT_POD_QUOTA_BYTES] (default: 1073741824)\n  \
+               --reserved-pods <CSV>              Comma-separated reserved/tombstoned pod_ids [env: WOLIN_RESERVED_PODS]\n  \
+               --admin-token <TOKEN>              Shared Bearer token for /api/pods admin lifecycle [env: WOLIN_ADMIN_TOKEN]\n  \
                --healthcheck                      Probe local /healthz endpoint and exit 0 if healthy\n  \
                -h, --help                         Print help information\n  \
                -V, --version                      Print version information",
@@ -662,6 +787,17 @@ impl ServerCliConfig {
                     let val = take_val(inline_val, &mut iter, "--pod-quota-bytes")?;
                     cfg.pod_quota_bytes = parse_pod_quota_bytes(&val, "--pod-quota-bytes")?;
                 }
+                "--reserved-pods" => {
+                    let val = take_val(inline_val, &mut iter, "--reserved-pods")?;
+                    cfg.reserved_pods = parse_reserved_pods(&val, "--reserved-pods", true)?;
+                }
+                "--admin-token" => {
+                    let val = take_val(inline_val, &mut iter, "--admin-token")?;
+                    if val.trim().is_empty() {
+                        return Err("--admin-token must not be empty".to_string());
+                    }
+                    cfg.admin_token = Some(val.trim().to_string());
+                }
                 unknown => {
                     return Err(format!(
                         "Unknown CLI flag '{unknown}'. Run with --help for usage."
@@ -728,6 +864,12 @@ impl ServerCliConfig {
         }
         if let Some(val) = non_empty_env(get_env, "WOLIN_DEFAULT_POD_QUOTA_BYTES") {
             self.pod_quota_bytes = parse_pod_quota_bytes(&val, "WOLIN_DEFAULT_POD_QUOTA_BYTES")?;
+        }
+        if let Some(val) = non_empty_env(get_env, "WOLIN_RESERVED_PODS") {
+            self.reserved_pods = parse_reserved_pods(&val, "WOLIN_RESERVED_PODS", false)?;
+        }
+        if let Some(val) = non_empty_env(get_env, "WOLIN_ADMIN_TOKEN") {
+            self.admin_token = Some(val);
         }
         Ok(())
     }
@@ -882,6 +1024,39 @@ fn parse_pod_quota_bytes(val: &str, source: &str) -> Result<u64, String> {
         return Err(format!("{source} must be greater than 0"));
     }
     Ok(parsed)
+}
+
+fn parse_reserved_pods(
+    val: &str,
+    source: &str,
+    allow_empty_clear: bool,
+) -> Result<BTreeSet<String>, String> {
+    let trimmed = val.trim();
+    if trimmed.is_empty() {
+        if allow_empty_clear {
+            return Ok(BTreeSet::new());
+        }
+        return Err(format!("{source} must not be empty"));
+    }
+
+    let mut out = BTreeSet::new();
+    for raw_part in trimmed.split(',') {
+        let part = raw_part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let lower = part.to_ascii_lowercase();
+        PodStoreManager::validate_pod_id_syntax(&lower)
+            .map_err(|e| format!("Invalid pod_id '{part}' in {source}: {e}"))?;
+        out.insert(lower);
+    }
+
+    if out.is_empty() {
+        return Err(format!(
+            "{source} must contain at least one valid pod_id handle"
+        ));
+    }
+    Ok(out)
 }
 
 fn parse_bool(val: &str, source: &str) -> Result<bool, String> {
@@ -1483,5 +1658,83 @@ mod tests {
         }
         assert!(ServerCliConfig::parse_from(["wolin-server", "--max-open-pods", "0"]).is_err());
         assert!(ServerCliConfig::parse_from(["wolin-server", "--pod-quota-bytes", "0"]).is_err());
+    }
+
+    #[test]
+    fn unit_reserved_pods_cli_and_env_parsing() {
+        let CliParseOutcome::Run(defaults) =
+            ServerCliConfig::parse_from(["wolin-server"]).expect("default parse")
+        else {
+            panic!("expected Run");
+        };
+        assert!(defaults.reserved_pods.is_empty());
+
+        let CliParseOutcome::Run(from_env) =
+            ServerCliConfig::parse_from_with_env(["wolin-server"], |k| {
+                (k == "WOLIN_RESERVED_PODS")
+                    .then(|| "vip-one, Retired-Pod , founder-2025,".to_string())
+            })
+            .expect("WOLIN_RESERVED_PODS parse")
+        else {
+            panic!("expected Run");
+        };
+        assert_eq!(
+            from_env
+                .reserved_pods
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["founder-2025", "retired-pod", "vip-one"]
+        );
+
+        // CLI --reserved-pods overrides WOLIN_RESERVED_PODS, and --reserved-pods="" clears it
+        let CliParseOutcome::Run(cli_override) = ServerCliConfig::parse_from_with_env(
+            [
+                "wolin-server",
+                "--reserved-pods",
+                "custom-alpha,custom-beta",
+            ],
+            |k| (k == "WOLIN_RESERVED_PODS").then(|| "vip-one".to_string()),
+        )
+        .expect("CLI --reserved-pods override") else {
+            panic!("expected Run");
+        };
+        assert_eq!(
+            cli_override
+                .reserved_pods
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["custom-alpha", "custom-beta"]
+        );
+
+        let CliParseOutcome::Run(cleared) =
+            ServerCliConfig::parse_from_with_env(["wolin-server", "--reserved-pods="], |k| {
+                (k == "WOLIN_RESERVED_PODS").then(|| "vip-one".to_string())
+            })
+            .expect("CLI --reserved-pods= empty clear")
+        else {
+            panic!("expected Run");
+        };
+        assert!(cleared.reserved_pods.is_empty());
+
+        // Malformed handles in WOLIN_RESERVED_PODS or --reserved-pods must fail closed
+        for bad_csv in [
+            "ab",
+            "xn--bad",
+            "-leading",
+            "trailing-",
+            "bad_pod",
+            "../etc",
+            ",,,",
+        ] {
+            assert!(
+                ServerCliConfig::parse_from_with_env(["wolin-server"], |k| {
+                    (k == "WOLIN_RESERVED_PODS").then(|| bad_csv.to_string())
+                })
+                .is_err(),
+                "expected WOLIN_RESERVED_PODS='{bad_csv}' to fail closed"
+            );
+        }
     }
 }

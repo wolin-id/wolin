@@ -80,8 +80,61 @@ pub struct ProvisionPodResponse {
     pub seeded_resources: Vec<String>,
 }
 
-/// Validate that `pod_id` is a safe RFC 1123 lowercase DNS label (`[a-z0-9-]`, 1..=63 chars)
-/// and does not collide with reserved infrastructure/system routes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RetirePodRequest {
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub retired_at: Option<i64>,
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+fn matches_configured_admin_token(
+    headers: &HeaderMap,
+    config: &LdpConfig,
+) -> Result<bool, LdpError> {
+    let Some(ref expected) = config.admin_token else {
+        return Ok(false);
+    };
+    let mut auth_iter = headers.get_all(header::AUTHORIZATION).iter();
+    let Some(raw_hdr) = auth_iter.next() else {
+        return Ok(false);
+    };
+    if auth_iter.next().is_some() {
+        return Err(LdpError::Unauthenticated(
+            "Multiple Authorization headers are not permitted".to_string(),
+        ));
+    }
+    let Ok(hdr_str) = raw_hdr.to_str() else {
+        return Err(LdpError::Unauthenticated(
+            "Malformed Authorization header".to_string(),
+        ));
+    };
+    let Some((scheme, token)) = hdr_str.trim().split_once(' ') else {
+        return Ok(false);
+    };
+    if !scheme.eq_ignore_ascii_case("Bearer") {
+        return Ok(false);
+    }
+    Ok(constant_time_eq(
+        token.trim().as_bytes(),
+        expected.as_bytes(),
+    ))
+}
+
+/// Validate that `pod_id` is a safe lowercase DNS label (`3..=32` chars, `[a-z0-9-]`,
+/// starts and ends with `[a-z0-9]`, no consecutive hyphens `'--'`) and does not collide
+/// with reserved infrastructure/system routes.
 pub fn validate_pod_id(pod_id: &str) -> Result<(), LdpError> {
     PodStoreManager::validate_pod_id(pod_id).map_err(LdpError::from)
 }
@@ -221,8 +274,19 @@ pub async fn handle_provision_pod(
     let uri = req.uri().clone();
     let headers = req.headers().clone();
 
-    // Fail-closed validation if caller supplies an Authorization header.
-    let caller = extract_principal_for_request(&method, &uri, &headers, &state).await?;
+    let is_admin_caller = matches_configured_admin_token(&headers, &state.config)?;
+    if state.config.admin_token.is_some() && !is_admin_caller {
+        return Err(LdpError::Unauthenticated(
+            "Valid admin Bearer token is required on /api/pods".to_string(),
+        ));
+    }
+
+    // Fail-closed validation if caller supplies a non-admin Authorization header.
+    let caller = if is_admin_caller {
+        Principal::Anonymous
+    } else {
+        extract_principal_for_request(&method, &uri, &headers, &state).await?
+    };
 
     if let Some(raw_ct) = headers.get(header::CONTENT_TYPE) {
         let ct_str = raw_ct
@@ -253,6 +317,11 @@ pub async fn handle_provision_pod(
 
     let pod_id = payload.pod_id.trim();
     validate_pod_id(pod_id)?;
+    if state.config.reserved_pods.contains(pod_id) {
+        return Err(LdpError::Conflict(format!(
+            "Pod '{pod_id}' is reserved and cannot be provisioned"
+        )));
+    }
 
     let base_url = state.config.base_url.trim_end_matches('/');
     let pod_root_path = format!("/pods/{pod_id}/");
@@ -304,6 +373,13 @@ pub async fn handle_provision_pod(
     let _io_guard = state.catalog_lock.write().await;
     let mut catalog = state.catalog.write().await;
     *catalog = LdpCatalog::load_or_init(&state.physical_store).await?;
+
+    if let Some(tomb) = catalog.tombstones.get(pod_id) {
+        return Err(LdpError::Conflict(format!(
+            "Pod '{pod_id}' has been permanently retired ({}) and cannot be re-claimed",
+            tomb.reason
+        )));
+    }
 
     if catalog.entries.contains_key("/pods") {
         return Err(LdpError::Conflict(
@@ -675,9 +751,14 @@ pub async fn handle_get_pod_info(
     let _caller = extract_principal_for_request(&method, &uri, &headers, &state).await?;
 
     validate_pod_id(&pod_id)?;
+    if state.config.reserved_pods.contains(&pod_id) {
+        return Err(LdpError::NotFound(format!("Pod '{pod_id}' not found")));
+    }
     let wk_doc_path = format!("/pods/{pod_id}/.well-known/wolin.json");
     let catalog = state.catalog.read().await;
-    if !catalog.entries.contains_key(&format!("/pods/{pod_id}/")) {
+    if catalog.tombstones.contains_key(&pod_id)
+        || !catalog.entries.contains_key(&format!("/pods/{pod_id}/"))
+    {
         return Err(LdpError::NotFound(format!("Pod '{pod_id}' not found")));
     }
     drop(catalog);
@@ -694,6 +775,122 @@ pub async fn handle_get_pod_info(
     resp.headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     Ok(resp)
+}
+
+/// Permanently retire and tombstone a Pod (`DELETE /api/pods/{pod_id}`).
+/// Requires either the configured `WOLIN_ADMIN_TOKEN` Bearer secret or an authenticated
+/// Pod Owner granted `acl:Control` on `/pods/{pod_id}/` (never anonymous).
+pub async fn handle_retire_pod(
+    State(state): State<Arc<AppState>>,
+    Path(raw_pod_id): Path<String>,
+    req: Request,
+) -> Result<Response, LdpError> {
+    if req.uri().query().is_some() {
+        return Err(LdpError::BadRequest(
+            "Query parameters are not permitted on /api/pods/{pod_id}".to_string(),
+        ));
+    }
+
+    let method = req.method().clone();
+    let uri = req.uri().clone();
+    let headers = req.headers().clone();
+    let pod_id = raw_pod_id.trim().to_ascii_lowercase();
+    PodStoreManager::validate_legacy_pod_segment(&pod_id)?;
+
+    let is_admin_caller = matches_configured_admin_token(&headers, &state.config)?;
+    if !is_admin_caller {
+        if state.config.admin_token.is_some() && headers.contains_key(header::AUTHORIZATION) {
+            // Try principal extraction; if caller sent a bad Bearer admin token, fail closed 401
+            let caller = extract_principal_for_request(&method, &uri, &headers, &state).await?;
+            authorize_pod_owner_control(&state, &caller, &pod_id)?;
+        } else if state.config.admin_token.is_some() {
+            return Err(LdpError::Unauthenticated(
+                "Authentication required to retire a Pod".to_string(),
+            ));
+        } else {
+            let caller = extract_principal_for_request(&method, &uri, &headers, &state).await?;
+            authorize_pod_owner_control(&state, &caller, &pod_id)?;
+        }
+    }
+
+    let max_bytes = state.config.max_body_bytes.min(MAX_PROVISION_BODY_BYTES);
+    let body_bytes = to_bytes(req.into_body(), max_bytes).await.map_err(|_| {
+        LdpError::PayloadTooLarge(format!(
+            "Retirement payload exceeds maximum allowed size of {max_bytes} bytes"
+        ))
+    })?;
+
+    let payload: RetirePodRequest = if body_bytes.iter().all(|b| b.is_ascii_whitespace()) {
+        RetirePodRequest::default()
+    } else {
+        serde_json::from_slice(&body_bytes)
+            .map_err(|e| LdpError::BadRequest(format!("Malformed retirement JSON payload: {e}")))?
+    };
+
+    let reason = payload
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("retired");
+    let now_secs = payload.retired_at.unwrap_or_else(|| {
+        state.config.policy_clock_epoch_secs.unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0)
+        })
+    });
+
+    let tombstone = state.retire_pod(&pod_id, reason, now_secs).await?;
+    let mut resp = (
+        StatusCode::OK,
+        Json(json!({
+            "pod_id": pod_id,
+            "status": "retired",
+            "reason": tombstone.reason,
+            "retired_at": tombstone.retired_at,
+        })),
+    )
+        .into_response();
+    resp.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(resp)
+}
+
+fn authorize_pod_owner_control(
+    state: &AppState,
+    caller: &Principal,
+    pod_id: &str,
+) -> Result<(), LdpError> {
+    if matches!(caller, Principal::Anonymous) {
+        return Err(LdpError::Unauthenticated(
+            "Authentication required to retire a Pod".to_string(),
+        ));
+    }
+    let pod_target = wolin_core::ResourceUri(format!(
+        "{}/pods/{pod_id}/",
+        state.config.pod_uri_prefix.trim_end_matches('/')
+    ));
+    let engine = state
+        .policy_engine
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    let now_secs = state.config.policy_clock_epoch_secs.unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    });
+    match engine.evaluate_policy_at(
+        caller,
+        &pod_target,
+        wolin_policy::AccessMode::Control,
+        now_secs,
+    ) {
+        wolin_policy::AccessDecision::Permit => Ok(()),
+        wolin_policy::AccessDecision::Deny { reason } => Err(LdpError::Forbidden(reason)),
+    }
 }
 
 #[derive(Clone, Copy)]

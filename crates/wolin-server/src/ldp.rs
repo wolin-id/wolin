@@ -75,9 +75,17 @@ pub struct LdpEntry {
     pub size_bytes: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PodTombstone {
+    pub reason: String,
+    pub retired_at: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LdpCatalog {
     pub entries: BTreeMap<String, LdpEntry>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tombstones: BTreeMap<String, PodTombstone>,
 }
 
 impl Default for LdpCatalog {
@@ -93,7 +101,10 @@ impl Default for LdpCatalog {
                 size_bytes: 0,
             },
         );
-        Self { entries }
+        Self {
+            entries,
+            tombstones: BTreeMap::new(),
+        }
     }
 }
 
@@ -279,9 +290,18 @@ async fn handle_options(
         AccessMode::Read
     };
     authorize(state, principal, &target.policy_target, required_mode)?;
-    let _ = PodStoreManager::pod_id_from_canonical_path(&target.canonical_path)?;
+    let target_pod_id =
+        PodStoreManager::pod_id_from_canonical_path(&target.canonical_path)?.map(str::to_string);
 
     let catalog = state.catalog.read().await;
+    if let Some(ref pod_id) = target_pod_id
+        && (state.config.reserved_pods.contains(pod_id) || catalog.tombstones.contains_key(pod_id))
+    {
+        return Err(LdpError::NotFound(format!(
+            "LDP resource '{}' not found",
+            target.canonical_path
+        )));
+    }
     let kind = catalog
         .entries
         .get(&target.canonical_path)
@@ -311,9 +331,18 @@ async fn handle_get_or_head(
         AccessMode::Read
     };
     authorize(state, principal, &target.policy_target, required_mode)?;
-    let _ = PodStoreManager::pod_id_from_canonical_path(&target.canonical_path)?;
+    let target_pod_id =
+        PodStoreManager::pod_id_from_canonical_path(&target.canonical_path)?.map(str::to_string);
 
     let catalog = state.catalog.read().await;
+    if let Some(ref pod_id) = target_pod_id
+        && (state.config.reserved_pods.contains(pod_id) || catalog.tombstones.contains_key(pod_id))
+    {
+        return Err(LdpError::NotFound(format!(
+            "LDP resource '{}' not found",
+            target.canonical_path
+        )));
+    }
     let Some(entry) = catalog.entries.get(&target.canonical_path).cloned() else {
         return Err(LdpError::NotFound(format!(
             "LDP resource '{}' not found",
@@ -601,6 +630,13 @@ async fn handle_put(
     let _io_guard = state.catalog_lock.write().await;
     let mut catalog = state.catalog.write().await;
     *catalog = LdpCatalog::load_or_init(&state.physical_store).await?;
+    if let Some(ref pod_id) = target_pod_id
+        && (state.config.reserved_pods.contains(pod_id) || catalog.tombstones.contains_key(pod_id))
+    {
+        return Err(LdpError::Conflict(format!(
+            "Pod '{pod_id}' is reserved or retired and cannot be modified"
+        )));
+    }
     validate_hierarchy_for_write(&catalog, &target.canonical_path, target.is_container_path)?;
 
     let existing = catalog.entries.get(&target.canonical_path).cloned();
@@ -860,6 +896,13 @@ async fn handle_post(
     let ext_child_iri = child_target.external_iri(&state.config.base_url, &child_path);
     let child_pod_id =
         PodStoreManager::pod_id_from_canonical_path(&child_path)?.map(str::to_string);
+    if let Some(ref pod_id) = child_pod_id
+        && (state.config.reserved_pods.contains(pod_id) || catalog.tombstones.contains_key(pod_id))
+    {
+        return Err(LdpError::Conflict(format!(
+            "Pod '{pod_id}' is reserved or retired and cannot be modified"
+        )));
+    }
     let child_graph_store = state.pod_stores.store_for_path(&child_path)?;
 
     let (child_kind, stored_ct, new_etag, new_size_bytes, projected_pod_usage) =
@@ -1100,6 +1143,13 @@ async fn handle_patch(
     let _io_guard = state.catalog_lock.write().await;
     let mut catalog = state.catalog.write().await;
     *catalog = LdpCatalog::load_or_init(&state.physical_store).await?;
+    if let Some(pod_id) = PodStoreManager::pod_id_from_canonical_path(&target.canonical_path)?
+        && (state.config.reserved_pods.contains(pod_id) || catalog.tombstones.contains_key(pod_id))
+    {
+        return Err(LdpError::Conflict(format!(
+            "Pod '{pod_id}' is reserved or retired and cannot be modified"
+        )));
+    }
     validate_hierarchy_for_write(&catalog, &target.canonical_path, target.is_container_path)?;
 
     let existing = catalog.entries.get(&target.canonical_path).cloned();
@@ -1280,6 +1330,13 @@ async fn handle_delete(
     let _io_guard = state.catalog_lock.write().await;
     let mut catalog = state.catalog.write().await;
     *catalog = LdpCatalog::load_or_init(&state.physical_store).await?;
+    if let Some(ref pod_id) = target_pod_id
+        && (state.config.reserved_pods.contains(pod_id) || catalog.tombstones.contains_key(pod_id))
+    {
+        return Err(LdpError::Conflict(format!(
+            "Pod '{pod_id}' is reserved or retired and cannot be modified"
+        )));
+    }
     let Some(entry) = catalog.entries.get(&target.canonical_path).cloned() else {
         return Err(LdpError::NotFound(format!(
             "LDP resource '{}' not found",
@@ -2505,9 +2562,26 @@ pub(crate) fn rehydrate_persisted_acl_rules(
         if !is_acl_canonical_path(path) {
             continue;
         }
+        if let Some(rest) = path.strip_prefix("/pods/")
+            && let Some((seg, _)) = rest.split_once('/')
+            && (config.reserved_pods.contains(seg) || catalog.tombstones.contains_key(seg))
+        {
+            continue;
+        }
         let target = build_ldp_target_from_canonical(path, &config.pod_uri_prefix);
         let acl_iri = http_iri(&config.base_url, path);
-        let store = pod_stores.store_for_path(path)?;
+        let store = match pod_stores.store_for_path(path) {
+            Ok(s) => s,
+            Err(wolin_core::WolinError::InvalidFormat(msg)) => {
+                tracing::warn!(
+                    acl_path = %path,
+                    reason = %msg,
+                    "Skipping persisted .acl under legacy or newly-reserved pod_id during startup rehydration"
+                );
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         let triples = store.get_named_graph_triples(&acl_iri)?;
         if triples.is_empty() {
             continue;

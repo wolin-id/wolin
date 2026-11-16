@@ -1357,3 +1357,489 @@ async fn concurrent_pod_provisioning_race_and_persistent_restart_rehydration() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn pod_id_security_constraints_reserved_env_and_tombstone_defense_in_depth() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let idx = SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "wolin_tombstone_persist_{}_{nanos}_{idx}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let base_url = "http://pod.wolin.cloud";
+    let make_cfg = || {
+        LdpConfig::new(base_url, "wolin://pod")
+            .with_oidc_options(OidcValidationOptions::new(LOCAL_WOLIN_ISSUER).with_now(TEST_NOW))
+            .with_pod_cloud_domain("wolin.cloud")
+            .with_reserved_pods(["vip-founder", "legacy-brand"])
+            .with_policy_clock(TEST_NOW)
+    };
+
+    {
+        let state = AppState::new_persistent(&dir, PolicyEngine::new(), make_cfg())
+            .await
+            .unwrap();
+        let app = build_router(Arc::clone(&state));
+
+        // 1. Strict pod_id format & static reserved blocklist -> 400 Bad Request
+        let overlong = "a".repeat(33);
+        for bad_id in [
+            "a",
+            "ab",
+            overlong.as_str(),
+            "xn--80akhbyknj4f",
+            "foo--bar",
+            "wolin",
+            "entropy",
+            "postmaster",
+            "no-reply",
+            "billing",
+            "status",
+            "staging",
+            "ns1",
+            "cdn",
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/pods")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(json!({ "pod_id": bad_id }).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "expected bad/static-reserved pod_id '{bad_id}' to fail with 400"
+            );
+        }
+
+        // Subdomain Host header with punycode or short label also fails closed with 400
+        for bad_host in [
+            "ab.wolin.cloud",
+            "xn--pple-43d.wolin.cloud",
+            "wolin.wolin.cloud",
+        ] {
+            let sub_resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/profile/card")
+                        .header(header::HOST, bad_host)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                sub_resp.status(),
+                StatusCode::BAD_REQUEST,
+                "expected Host '{bad_host}' to fail closed with 400"
+            );
+        }
+
+        // 2. WOLIN_RESERVED_PODS (`with_reserved_pods`) rejects configured handles with 409 Conflict
+        for custom_reserved in ["vip-founder", "legacy-brand"] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/pods")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(json!({ "pod_id": custom_reserved }).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::CONFLICT,
+                "expected WOLIN_RESERVED_PODS handle '{custom_reserved}' to fail with 409 Conflict"
+            );
+        }
+
+        // 3. Provision legitimate `alice-ok`, then retire into engine tombstone -> 404 on GET, 409 on re-claim
+        let ok_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/pods")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "pod_id": "alice-ok",
+                            "display_name": "Alice Temporary"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok_resp.status(), StatusCode::CREATED);
+
+        state
+            .retire_pod("alice-ok", "account_deleted", TEST_NOW)
+            .await
+            .expect("retire_pod succeeds");
+
+        // Provision a sibling pod (`bob-peer`) and write via MCP `wolin_write_resource`
+        // to ensure `PodCatalog::persist` preserves `tombstones` in `__wolin_meta/catalog.json`!
+        let bob_did = "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK"; // gitleaks:allow
+        let bob_prov = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/pods")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "pod_id": "bob-peer",
+                            "owner_webid": bob_did,
+                            "display_name": "Bob Peer"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bob_prov.status(), StatusCode::CREATED);
+
+        let mcp_write_bob = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/mcp")
+                    .header(header::AUTHORIZATION, format!("DID {bob_did}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "tools/call",
+                            "params": {
+                                "name": "wolin_write_resource",
+                                "arguments": {
+                                    "uri": "wolin://pod/pods/bob-peer/private/note.ttl",
+                                    "content_type": "text/turtle",
+                                    "content": "<#n> <http://purl.org/dc/terms/title> \"SiblingWrite\" ."
+                                }
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mcp_write_bob.status(), StatusCode::OK);
+
+        let info_after_retire = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/pods/alice-ok")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(info_after_retire.status(), StatusCode::NOT_FOUND);
+
+        let reclaim_resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/pods")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "pod_id": "alice-ok" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reclaim_resp.status(), StatusCode::CONFLICT);
+    }
+
+    // 4. Restart persistent AppState -> tombstone survives on disk and still blocks re-claim with 409 Conflict!
+    {
+        let reopened = AppState::new_persistent(&dir, PolicyEngine::new(), make_cfg())
+            .await
+            .unwrap();
+        let app = build_router(reopened);
+
+        let reclaim_after_restart = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/pods")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "pod_id": "alice-ok" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reclaim_after_restart.status(), StatusCode::CONFLICT);
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn http_pod_retirement_admin_token_rocksdb_purge_and_mcp_read_blocking() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let idx = SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "wolin_retire_http_purge_{}_{nanos}_{idx}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let base_url = "http://pod.wolin.cloud";
+    let admin_secret = "super-secret-admin-token-01";
+    let alice_did = "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK"; // gitleaks:allow
+    let mallory_did = "did:nostr:7e7e9c42a91bfef19fa929e5fda1b72e0ebc1a4c1141673e2794234d86addf4e";
+
+    let cfg = LdpConfig::new(base_url, "wolin://pod")
+        .with_oidc_options(OidcValidationOptions::new(LOCAL_WOLIN_ISSUER).with_now(TEST_NOW))
+        .with_pod_cloud_domain("wolin.cloud")
+        .with_policy_clock(TEST_NOW)
+        .with_admin_token(admin_secret);
+
+    let state = AppState::new_persistent(&dir, PolicyEngine::new(), cfg)
+        .await
+        .unwrap();
+    let app = build_router(state.clone());
+
+    // 1. When WOLIN_ADMIN_TOKEN is configured, unauthenticated POST /api/pods fails closed with 401
+    let unauth_prov = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/pods")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({ "pod_id": "retire-me", "owner_webid": alice_did }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauth_prov.status(), StatusCode::UNAUTHORIZED);
+
+    // 2. Provision with valid Bearer admin token -> 201 Created and isolated RocksDB dir exists
+    let auth_prov = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/pods")
+                .header(header::AUTHORIZATION, format!("Bearer {admin_secret}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "pod_id": "retire-me",
+                        "owner_webid": alice_did,
+                        "display_name": "Retire Me"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(auth_prov.status(), StatusCode::CREATED);
+    assert!(dir.join("pods").join("retire-me").exists());
+    assert!(state.pod_stores.is_pod_open("retire-me"));
+
+    // Write a private RDF resource into `retire-me`
+    let write_note = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/pods/retire-me/private/secret.ttl")
+                .header(header::AUTHORIZATION, format!("DID {alice_did}"))
+                .header(header::CONTENT_TYPE, "text/turtle")
+                .body(Body::from(
+                    "<#s> <http://purl.org/dc/terms/title> \"TopSecretBeforeRetire\" .",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(write_note.status(), StatusCode::CREATED);
+
+    // 3. Unauthenticated and non-owner DELETE /api/pods/retire-me fail closed (401 / 403)
+    let unauth_del = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri("/api/pods/retire-me")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauth_del.status(), StatusCode::UNAUTHORIZED);
+
+    let mallory_del = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri("/api/pods/retire-me")
+                .header(header::AUTHORIZATION, format!("DID {mallory_did}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(mallory_del.status(), StatusCode::FORBIDDEN);
+
+    // 4. Valid Bearer admin token retires `retire-me` -> 200 OK, RocksDB dir purged, LRU evicted!
+    let admin_del = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri("/api/pods/retire-me")
+                .header(header::AUTHORIZATION, format!("Bearer {admin_secret}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({ "reason": "gdpr_erasure", "retired_at": TEST_NOW }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(admin_del.status(), StatusCode::OK);
+    assert!(!state.pod_stores.is_pod_open("retire-me"));
+    assert!(!dir.join("pods").join("retire-me").exists());
+
+    // 5. GET /api/pods/retire-me -> 404, LDP GET -> 401/403 (public WAC rules purged!), LDP PUT/DELETE -> 403/409, MCP read -> blocked!
+    let info_get = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/pods/retire-me")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(info_get.status(), StatusCode::NOT_FOUND);
+
+    let ldp_get = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/pods/retire-me/profile/card")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        ldp_get.status() == StatusCode::UNAUTHORIZED || ldp_get.status() == StatusCode::NOT_FOUND
+    );
+
+    let ldp_del = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri("/pods/retire-me/profile/card")
+                .header(header::AUTHORIZATION, format!("DID {alice_did}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(ldp_del.status() == StatusCode::FORBIDDEN || ldp_del.status() == StatusCode::CONFLICT);
+
+    let ldp_put_clean = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/pods/retire-me/public/zombie.ttl")
+                .header(header::AUTHORIZATION, format!("DID {alice_did}"))
+                .header(header::CONTENT_TYPE, "text/turtle")
+                .body(Body::from("<#z> <http://purl.org/dc/terms/title> \"No\" ."))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        ldp_put_clean.status() == StatusCode::FORBIDDEN
+            || ldp_put_clean.status() == StatusCode::CONFLICT
+    );
+
+    let mcp_read = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/mcp")
+                .header(header::AUTHORIZATION, format!("DID {alice_did}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 9,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "wolin_read_resource",
+                            "arguments": {
+                                "uri": "wolin://pod/pods/retire-me/private/secret.ttl"
+                            }
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(mcp_read.status(), StatusCode::OK);
+    let mcp_body = axum::body::to_bytes(mcp_read.into_body(), 16 * 1024)
+        .await
+        .unwrap();
+    let mcp_json: serde_json::Value = serde_json::from_slice(&mcp_body).unwrap();
+    assert_eq!(mcp_json["result"]["isError"], true);
+    assert!(
+        !mcp_json.to_string().contains("TopSecretBeforeRetire"),
+        "retired pod data must never leak via MCP"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
