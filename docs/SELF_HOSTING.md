@@ -26,16 +26,25 @@ CLI flag  >  WOLIN_* environment variable  >  built-in default
 | `WOLIN_STORAGE_DIR` | `-d`, `--storage-dir <DIR>` / `--in-memory` | *(in-memory)* | Persistent root directory (`blobs/` + `graph/`, `0700`); set `memory` for ephemeral |
 | `WOLIN_BASE_URL` | `--base-url <URL>` | `http://<host>:<port>` | Public canonical origin for RDF IRIs, `Location`, and discovery |
 | `WOLIN_POD_PREFIX` | `--pod-prefix <URI>` | `wolin://pod` | Internal `ResourceUri` prefix evaluated by the WAC/ACP PDP |
-| `WOLIN_POD_CLOUD_DOMAIN` | `--pod-cloud-domain <DOM>` | `wolin.cloud` | Root domain for `{pod_id}.{domain}` multi-tenant `Host` routing |
-| `WOLIN_OIDC_ISSUER` | `--oidc-issuer <URL>` | `https://auth.wolin.id` | Trusted Solid-OIDC / ZITADEL JWT issuer URL |
+| `WOLIN_POD_CLOUD_DOMAIN` | `--pod-cloud-domain <DOM>` | `wolin.cloud` | Root domain for `{pod_id}.{domain}` multi-tenant `Host` routing (e.g. `wolin.id`) |
+| `WOLIN_OIDC_ISSUER` | `--oidc-issuer <URL>` | `https://auth.wolin.id` | Trusted Solid-OIDC JWT issuer URL |
 | `WOLIN_OIDC_AUDIENCE` | `--oidc-audience <AUD>` | *(none)* | Optional required OIDC JWT `aud` claim |
+| `WOLIN_OIDC_JWKS_JSON` | `--oidc-jwks-json <JSON>` | *(none)* | Static OIDC public JWKS JSON (`ES256`/`ES384`/`RS256`/`PS256`/`EdDSA`) for `JwksSignatureVerifier` + `at+jwt` check |
+| `WOLIN_OIDC_LEEWAY_SECS` | `--oidc-leeway-secs <SECS>` | `0` | Allowed JWT clock skew leeway in seconds (`0..=300`) |
 | `WOLIN_OWNER_WEBID` | `--owner-webid <URI>` | *(none)* | Bootstrap WebID or DID (`did:key:...`, `did:web:...`) with root WAC owner rights |
 | `WOLIN_REQUIRE_EXPLICIT_DELEGATION` | `--require-explicit-delegation` | `false` | Require explicit `DelegationGrant` for delegated AI agents (`act.sub`) |
 | `WOLIN_MCP_ENABLED` | `--mcp-enabled <BOOL>` / `--no-mcp` | `true` | Enable or disable Native MCP JSON-RPC (`/mcp`) and SSE (`/mcp/sse`) |
 | `WOLIN_MAX_BODY_BYTES` | `--max-body-bytes <BYTES>` | `16777216` | Maximum accepted HTTP payload size in bytes (16 MiB) |
 | `WOLIN_MAX_OPEN_PODS` | `--max-open-pods <COUNT>` | `256` | Max open per-Pod RocksDB stores in the bounded LRU cache |
 | `WOLIN_DEFAULT_POD_QUOTA_BYTES` | `--pod-quota-bytes <BYTES>` | `1073741824` | Default per-Pod storage quota in bytes (`1 GiB`) |
+| `WOLIN_RESERVED_PODS` | `--reserved-pods <CSV>` | *(none)* | Extra reserved/tombstoned `pod_id` handles layered over the ~180 built-in reserved handles |
+| `WOLIN_ADMIN_TOKEN` | `--admin-token <TOKEN>` | *(none)* | Shared Bearer secret for `/api/pods` provisioning and `DELETE /api/pods/{pod_id}` tombstoning |
+| `WOLIN_ASSET_SIGNING_SECRET` | `--asset-signing-secret <SEC>` | *(none)* | Shared `HMAC-SHA256` (`wolin-asset-v1`) secret for 60s signed Edge/R2 `302` asset offload |
+| `WOLIN_ASSET_PUBLIC_BASE_URL` | `--asset-public-base-url <URL>` | *(none)* | Edge signed asset base URL (e.g. `https://auth.wolin.id/assets`) |
+| `WOLIN_ASSET_OFFLOAD_MIN_BYTES` | `--asset-offload-min-bytes <N>` | `262144` | Minimum `NonRDFSource` size (`256 KiB`) before authorized `GET` redirects via `302 Found` |
 | `WOLIN_LOG` / `RUST_LOG` | *(env only)* | `info,...` | Structured `tracing` log filter |
+
+> **Local Sandbox vs. Managed `$0` Free Tier**: For local development or CI without touching persistent disk, run `wolin-server --in-memory --port 4000` (~6 ms startup, ~15.3 MiB RSS). For live HTTPS/DPoP app testing without running a server, claim a **`$0` Free Tier (`1 GiB`)** Pod on `https://auth.wolin.id` / `https://pod.wolin.id` (`https://{handle}.wolin.id/`).
 
 ### 1.2 Quickstart A: Docker Compose (Recommended)
 
@@ -188,16 +197,25 @@ CLI 플래그  >  WOLIN_* 환경변수  >  내장 기본값
 | `WOLIN_STORAGE_DIR` | `-d`, `--storage-dir <DIR>` / `--in-memory` | *(인메모리)* | 영구 데이터 경로 (`blobs/` + `graph/`, `0700`); `memory` 지정 시 인메모리 |
 | `WOLIN_BASE_URL` | `--base-url <URL>` | `http://<host>:<port>` | 외부 공개 정규 Pod Base URL (RDF IRI, `Location`, 디스커버리 기준) |
 | `WOLIN_POD_PREFIX` | `--pod-prefix <URI>` | `wolin://pod` | WAC/ACP 정책 엔진 내부 정규 리소스 URI 프리픽스 |
-| `WOLIN_POD_CLOUD_DOMAIN` | `--pod-cloud-domain <DOM>` | `wolin.cloud` | `{pod_id}.{domain}` 서브도메인 라우팅용 루트 도메인 |
-| `WOLIN_OIDC_ISSUER` | `--oidc-issuer <URL>` | `https://auth.wolin.id` | 신뢰할 Solid-OIDC / ZITADEL 토큰 발급자(Issuer) URL |
+| `WOLIN_POD_CLOUD_DOMAIN` | `--pod-cloud-domain <DOM>` | `wolin.cloud` | `{pod_id}.{domain}` 서브도메인 라우팅용 루트 도메인 (예: `wolin.id`) |
+| `WOLIN_OIDC_ISSUER` | `--oidc-issuer <URL>` | `https://auth.wolin.id` | 신뢰할 Solid-OIDC 토큰 발급자(Issuer) URL |
 | `WOLIN_OIDC_AUDIENCE` | `--oidc-audience <AUD>` | *(없음)* | 선택적 필수 JWT `aud` 클레임 |
+| `WOLIN_OIDC_JWKS_JSON` | `--oidc-jwks-json <JSON>` | *(없음)* | `JwksSignatureVerifier` + `at+jwt` 서명 검증용 정적 공개 JWKS JSON (`ES256`/`RS256`/`EdDSA` 등) |
+| `WOLIN_OIDC_LEEWAY_SECS` | `--oidc-leeway-secs <SECS>` | `0` | 허용 시계 오차(초, `0..=300`) |
 | `WOLIN_OWNER_WEBID` | `--owner-webid <URI>` | *(없음)* | 부트스트랩 루트 소유자 WebID 또는 DID (`did:key:...`, `did:web:...`) |
 | `WOLIN_REQUIRE_EXPLICIT_DELEGATION` | `--require-explicit-delegation` | `false` | AI 에이전트(`act.sub`) 요청 시 명시적 `DelegationGrant` 요구 여부 |
 | `WOLIN_MCP_ENABLED` | `--mcp-enabled <BOOL>` / `--no-mcp` | `true` | Native MCP 게이트웨이(`/mcp`, `/mcp/sse`) 활성화 여부 |
 | `WOLIN_MAX_BODY_BYTES` | `--max-body-bytes <BYTES>` | `16777216` | 최대 허용 HTTP 요청 본문 크기 (기본 16 MiB) |
 | `WOLIN_MAX_OPEN_PODS` | `--max-open-pods <COUNT>` | `256` | 동시 오픈 허용 Pod별 RocksDB 그래프 스토어 LRU 상한 |
 | `WOLIN_DEFAULT_POD_QUOTA_BYTES` | `--pod-quota-bytes <BYTES>` | `1073741824` | Pod당 기본 스토리지 쿼터 바이트 (`1 GiB`) |
+| `WOLIN_RESERVED_PODS` | `--reserved-pods <CSV>` | *(없음)* | 기본 내장 ~180개 예약 핸들 외 추가 예약/차단 `pod_id` 목록 (쉼표 구분) |
+| `WOLIN_ADMIN_TOKEN` | `--admin-token <TOKEN>` | *(없음)* | `/api/pods` 프로비저닝 및 `DELETE /api/pods/{pod_id}` Tombstone 처리용 관리자 Bearer 토큰 |
+| `WOLIN_ASSET_SIGNING_SECRET` | `--asset-signing-secret <SEC>` | *(없음)* | 60초 만료 Edge/R2 `302` 에셋 오프로딩용 `HMAC-SHA256`(`wolin-asset-v1`) 서명 시크릿 |
+| `WOLIN_ASSET_PUBLIC_BASE_URL` | `--asset-public-base-url <URL>` | *(없음)* | 서명 에셋 스트리밍 엣지 Base URL (예: `https://auth.wolin.id/assets`) |
+| `WOLIN_ASSET_OFFLOAD_MIN_BYTES` | `--asset-offload-min-bytes <N>` | `262144` | `302 Found` 오프로딩을 적용할 최소 `NonRDFSource` 크기 (기본 `256 KiB`) |
 | `WOLIN_LOG` / `RUST_LOG` | *(환경변수 전용)* | `info,...` | 구조화 로그 레벨 필터 |
+
+> **로컬 개발 샌드박스 vs. `$0` Free Tier**: 디스크 상태 없는 로컬/CI 테스트 시에는 `wolin-server --in-memory --port 4000`(~6 ms 기동, ~15.3 MiB RSS)을 사용하고, 서버 구축 없이 실제 HTTPS/DPoP 연동을 검증할 때는 `https://auth.wolin.id` / `https://pod.wolin.id`의 **`$0` Free Tier (`1 GiB`)** Pod를 무료로 발급받아 사용할 수 있습니다.
 
 ### 2.2 빠른 시작 A: Docker Compose (권장)
 

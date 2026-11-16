@@ -8,10 +8,10 @@
 
 ## Security Architecture
 
-Wolin enforces strict zero-trust boundaries across its runtime:
-- **Authentication**: Solid-OIDC + RFC 9449 DPoP proof-of-possession with replay protection, plus OIDC / ZITADEL JWT validation.
-- **Authorization**: Deterministic W3C WAC / ACP dual Policy Decision Point (`wolin-policy`) with explicit deny precedence.
-- **Tenant Isolation**: Subdomain origin isolation (`{pod_id}.{pod_cloud_domain}`) for multi-tenant Pod Cloud deployments.
+Wolin (月印千江) enforces strict zero-trust boundaries across its runtime:
+- **Authentication**: Solid-OIDC + RFC 9449 DPoP proof-of-possession with `jti` replay protection, cryptographic `JwksSignatureVerifier` (`ES256`/`ES384`/`RS256`/`PS256`/`EdDSA`), and `typ: "at+jwt"` enforcement blocking `id_token` confusion.
+- **Authorization**: Deterministic W3C WAC / ACP dual Policy Decision Point (`wolin-policy`) with explicit deny precedence, verified before any binary `302` `HMAC-SHA256` (`wolin-asset-v1`) Edge/R2 offload token is minted.
+- **Tenant & Handle Isolation**: Subdomain origin isolation (`{pod_id}.{pod_cloud_domain}`), per-Pod physical Oxigraph RocksDB stores with bounded LRU (`256`) and `1 GiB` storage quotas, ~180 reserved handles, and permanent Tombstone defense-in-depth (`410 Gone`).
 - **Memory Safety**: Pure Rust AOT runtime with zero unsafe deserialization on untrusted RDF or HTTP payloads.
 
 ## Reporting a Vulnerability (Private Vulnerability Reporting)
