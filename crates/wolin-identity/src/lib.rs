@@ -10,7 +10,8 @@ pub use oidc::{
     OidcValidator,
 };
 pub use solid_oidc::{
-    DpopProofClaims, DpopReplayCache, DpopValidationContext, HttpWebIdDereferencer, LDP_INBOX_IRI,
-    PIM_STORAGE_IRI, SOLID_OIDC_ISSUER_IRI, WebIdDereferencer, WebIdProfile,
-    compute_jwk_thumbprint_sha256, sha256_base64url, verify_dpop_proof,
+    DpopProofClaims, DpopReplayCache, DpopValidationContext, HttpWebIdDereferencer,
+    JwksSignatureVerifier, LDP_INBOX_IRI, PIM_STORAGE_IRI, SOLID_OIDC_ISSUER_IRI,
+    WebIdDereferencer, WebIdProfile, compute_jwk_thumbprint_sha256, sha256_base64url,
+    verify_dpop_proof,
 };

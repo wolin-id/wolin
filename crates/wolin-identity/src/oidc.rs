@@ -124,6 +124,8 @@ pub trait JwtSignatureVerifier: Send + Sync {
 struct JwtHeader {
     alg: String,
     #[serde(default)]
+    typ: Option<String>,
+    #[serde(default)]
     kid: Option<String>,
 }
 
@@ -245,6 +247,23 @@ impl OidcValidator {
 
         match dpop_proof_and_ctx {
             Some((dpop_jwt, dpop_ctx)) => {
+                // RFC 9068 §2.1: Prevent id_token (typ: "JWT") confusion on DPoP-bound Solid access tokens.
+                let typ_lower = envelope
+                    .header
+                    .typ
+                    .as_deref()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_ascii_lowercase();
+                if !matches!(
+                    typ_lower.as_str(),
+                    "at+jwt" | "application/at+jwt" | "dpop-bound-id+jwt"
+                ) {
+                    return Err(WolinError::Unauthenticated(
+                        "DPoP access token requires JWT header typ 'at+jwt' (id_token confusion blocked)"
+                            .to_string(),
+                    ));
+                }
                 let proof = crate::solid_oidc::verify_dpop_proof(dpop_jwt, dpop_ctx)?;
                 let expected_jkt = claims
                     .cnf

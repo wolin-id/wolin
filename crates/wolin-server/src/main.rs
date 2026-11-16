@@ -1,7 +1,8 @@
+use std::sync::Arc;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 use wolin_core::{ResourceUri, WebId};
-use wolin_identity::OidcValidationOptions;
+use wolin_identity::{JwksSignatureVerifier, OidcValidationOptions};
 use wolin_policy::{AccessMode, PolicyEngine, SubjectMatcher, WacRule};
 use wolin_server::{
     AppState, CliParseOutcome, LdpConfig, ServerCliConfig, build_router, run_healthcheck_probe,
@@ -85,7 +86,8 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let mut oidc_opts = OidcValidationOptions::new(&cli_cfg.oidc_issuer);
+    let mut oidc_opts =
+        OidcValidationOptions::new(&cli_cfg.oidc_issuer).with_leeway(cli_cfg.oidc_leeway_secs);
     if let Some(ref aud) = cli_cfg.oidc_audience {
         oidc_opts = oidc_opts.with_audience(aud);
     }
@@ -100,6 +102,10 @@ async fn main() -> anyhow::Result<()> {
         .with_reserved_pods(cli_cfg.reserved_pods.iter().cloned())
         .with_mcp_enabled(cli_cfg.mcp_enabled)
         .with_asset_offload_min_bytes(cli_cfg.asset_offload_min_bytes);
+    if let Some(ref raw_jwks) = cli_cfg.oidc_jwks_json {
+        let verifier = JwksSignatureVerifier::from_jwks_json(raw_jwks)?;
+        ldp_config = ldp_config.with_jwt_verifier(Arc::new(verifier));
+    }
     if let Some(ref token) = cli_cfg.admin_token {
         ldp_config = ldp_config.with_admin_token(token);
     }

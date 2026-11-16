@@ -23,8 +23,8 @@ use ldp::LdpCatalog;
 use serde_json::json;
 use tower_http::trace::{DefaultMakeSpan, TraceLayer};
 use wolin_identity::{
-    DpopReplayCache, HttpWebIdDereferencer, JwtSignatureVerifier, OidcValidationOptions,
-    WebIdDereferencer,
+    DpopReplayCache, HttpWebIdDereferencer, JwksSignatureVerifier, JwtSignatureVerifier,
+    OidcValidationOptions, WebIdDereferencer,
 };
 use wolin_mcp::{DisclosurePolicy, McpAgentServer, McpGatewayConfig};
 use wolin_policy::PolicyEngine;
@@ -585,6 +585,8 @@ pub struct ServerCliConfig {
     pub pod_cloud_domain: String,
     pub oidc_issuer: String,
     pub oidc_audience: Option<String>,
+    pub oidc_jwks_json: Option<String>,
+    pub oidc_leeway_secs: i64,
     pub owner_webid: Option<String>,
     pub require_explicit_delegation: bool,
     pub mcp_enabled: bool,
@@ -609,6 +611,8 @@ impl Default for ServerCliConfig {
             pod_cloud_domain: "wolin.cloud".to_string(),
             oidc_issuer: "https://auth.wolin.id".to_string(),
             oidc_audience: None,
+            oidc_jwks_json: None,
+            oidc_leeway_secs: 0,
             owner_webid: None,
             require_explicit_delegation: false,
             mcp_enabled: true,
@@ -677,6 +681,8 @@ impl ServerCliConfig {
                --pod-cloud-domain <DOMAIN>        Multi-tenant subdomain root [env: WOLIN_POD_CLOUD_DOMAIN] (default: wolin.cloud)\n  \
                --oidc-issuer <URL>                Expected OIDC / ZITADEL issuer [env: WOLIN_OIDC_ISSUER] (default: https://auth.wolin.id)\n  \
                --oidc-audience <AUD>              Optional required OIDC audience [env: WOLIN_OIDC_AUDIENCE]\n  \
+               --oidc-jwks-json <JSON>            Static OIDC public JWKS JSON for JWS verification [env: WOLIN_OIDC_JWKS_JSON]\n  \
+               --oidc-leeway-secs <SECS>          Clock skew leeway in seconds (0..=300) [env: WOLIN_OIDC_LEEWAY_SECS] (default: 0)\n  \
                --owner-webid <WEBID_OR_DID>       Bootstrap WAC owner on Pod root [env: WOLIN_OWNER_WEBID]\n  \
                --require-explicit-delegation      Require DelegationGrant for AI agents [env: WOLIN_REQUIRE_EXPLICIT_DELEGATION]\n  \
                --no-require-explicit-delegation   Disable explicit DelegationGrant requirement\n  \
@@ -818,6 +824,14 @@ impl ServerCliConfig {
                     }
                     cfg.oidc_audience = Some(val.trim().to_string());
                 }
+                "--oidc-jwks-json" => {
+                    let val = take_val(inline_val, &mut iter, "--oidc-jwks-json")?;
+                    cfg.oidc_jwks_json = Some(parse_oidc_jwks_json(&val, "--oidc-jwks-json")?);
+                }
+                "--oidc-leeway-secs" => {
+                    let val = take_val(inline_val, &mut iter, "--oidc-leeway-secs")?;
+                    cfg.oidc_leeway_secs = parse_oidc_leeway_secs(&val, "--oidc-leeway-secs")?;
+                }
                 "--owner-webid" => {
                     let val = take_val(inline_val, &mut iter, "--owner-webid")?;
                     cfg.owner_webid = Some(parse_owner_webid(&val, "--owner-webid")?);
@@ -909,6 +923,12 @@ impl ServerCliConfig {
         }
         if let Some(val) = non_empty_env(get_env, "WOLIN_OIDC_AUDIENCE") {
             self.oidc_audience = Some(val);
+        }
+        if let Some(val) = non_empty_env(get_env, "WOLIN_OIDC_JWKS_JSON") {
+            self.oidc_jwks_json = Some(parse_oidc_jwks_json(&val, "WOLIN_OIDC_JWKS_JSON")?);
+        }
+        if let Some(val) = non_empty_env(get_env, "WOLIN_OIDC_LEEWAY_SECS") {
+            self.oidc_leeway_secs = parse_oidc_leeway_secs(&val, "WOLIN_OIDC_LEEWAY_SECS")?;
         }
         if let Some(val) = non_empty_env(get_env, "WOLIN_OWNER_WEBID") {
             self.owner_webid = Some(parse_owner_webid(&val, "WOLIN_OWNER_WEBID")?);
@@ -1025,6 +1045,23 @@ fn parse_base_url(val: &str, source: &str) -> Result<String, String> {
 
 fn parse_oidc_issuer(val: &str, source: &str) -> Result<String, String> {
     pods::validate_http_uri(val.trim(), source).map_err(|e| format!("{source}: {e:?}"))
+}
+
+fn parse_oidc_jwks_json(val: &str, source: &str) -> Result<String, String> {
+    let trimmed = val.trim();
+    JwksSignatureVerifier::from_jwks_json(trimmed).map_err(|e| format!("{source}: {e}"))?;
+    Ok(trimmed.to_string())
+}
+
+fn parse_oidc_leeway_secs(val: &str, source: &str) -> Result<i64, String> {
+    let parsed = val
+        .trim()
+        .parse::<i64>()
+        .map_err(|_| format!("Invalid integer for {source}: '{val}'"))?;
+    if !(0..=300).contains(&parsed) {
+        return Err(format!("{source} must be between 0 and 300 seconds"));
+    }
+    Ok(parsed)
 }
 
 fn parse_owner_webid(val: &str, source: &str) -> Result<String, String> {
@@ -1887,6 +1924,10 @@ mod tests {
             ),
             ("WOLIN_ASSET_OFFLOAD_MIN_BYTES", "-1"),
             ("WOLIN_ASSET_OFFLOAD_MIN_BYTES", "notanumber"),
+            ("WOLIN_OIDC_JWKS_JSON", "not-json"),
+            ("WOLIN_OIDC_JWKS_JSON", r#"{"keys":[]}"#),
+            ("WOLIN_OIDC_LEEWAY_SECS", "-5"),
+            ("WOLIN_OIDC_LEEWAY_SECS", "999"),
         ] {
             assert!(
                 ServerCliConfig::parse_from_with_env(["wolin-server"], |k| {

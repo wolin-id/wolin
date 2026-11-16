@@ -15,7 +15,7 @@ use ring::signature::{
 use serde::{Deserialize, Serialize};
 use wolin_core::{Result, WolinError};
 
-use crate::oidc::base64url_decode_segment;
+use crate::oidc::{JwtSignatureVerifier, base64url_decode_segment};
 
 pub const SOLID_OIDC_ISSUER_IRI: &str = "http://www.w3.org/ns/solid/terms#oidcIssuer";
 pub const PIM_STORAGE_IRI: &str = "http://www.w3.org/ns/pim/space#storage";
@@ -832,6 +832,112 @@ fn normalize_htu(raw: &str) -> Result<String> {
     ))
 }
 
+/// Static W3C/RFC 7517 JWKS (`{"keys": [...]}`) signature verifier implementing [`JwtSignatureVerifier`].
+#[derive(Debug, Clone)]
+pub struct JwksSignatureVerifier {
+    keys: Vec<serde_json::Value>,
+}
+
+impl JwksSignatureVerifier {
+    /// Parse and validate a public JWKS JSON document (`{"keys": [...]}`) or a single public JWK object.
+    /// Rejects empty key sets and any JWK containing private key parameters fail-closed.
+    pub fn from_jwks_json(raw_json: &str) -> Result<Self> {
+        let parsed: serde_json::Value = serde_json::from_str(raw_json.trim())
+            .map_err(|e| WolinError::InvalidFormat(format!("Malformed OIDC JWKS JSON: {e}")))?;
+
+        let raw_keys: Vec<serde_json::Value> = match parsed.get("keys") {
+            Some(serde_json::Value::Array(arr)) => arr.clone(),
+            Some(_) => {
+                return Err(WolinError::InvalidFormat(
+                    "JWKS 'keys' field must be a JSON array".to_string(),
+                ));
+            }
+            None if parsed.is_object() => vec![parsed],
+            None => {
+                return Err(WolinError::InvalidFormat(
+                    "OIDC JWKS must be a JSON object".to_string(),
+                ));
+            }
+        };
+
+        let mut valid_keys = Vec::new();
+        for key in raw_keys {
+            let obj = key.as_object().ok_or_else(|| {
+                WolinError::InvalidFormat("Each entry in JWKS 'keys' must be a JSON object".into())
+            })?;
+            for priv_field in FORBIDDEN_JWK_PRIVATE_FIELDS {
+                if obj.contains_key(*priv_field) {
+                    return Err(WolinError::InvalidFormat(format!(
+                        "JWKS entry must not contain private key field '{priv_field}'"
+                    )));
+                }
+            }
+            if let Some(use_val) = obj.get("use").and_then(|v| v.as_str())
+                && use_val != "sig"
+            {
+                continue;
+            }
+            let _ = compute_jwk_thumbprint_sha256(&key)?;
+            valid_keys.push(key);
+        }
+
+        if valid_keys.is_empty() {
+            return Err(WolinError::InvalidFormat(
+                "OIDC JWKS contains zero valid public signing keys".to_string(),
+            ));
+        }
+        Ok(Self { keys: valid_keys })
+    }
+}
+
+impl JwtSignatureVerifier for JwksSignatureVerifier {
+    fn verify(
+        &self,
+        alg: &str,
+        kid: Option<&str>,
+        signing_input: &[u8],
+        signature: &[u8],
+    ) -> Result<()> {
+        let candidates: Vec<&serde_json::Value> = match kid.map(str::trim).filter(|s| !s.is_empty())
+        {
+            Some(target_kid) => self
+                .keys
+                .iter()
+                .filter(|k| k.get("kid").and_then(|v| v.as_str()) == Some(target_kid))
+                .collect(),
+            None => {
+                if self.keys.len() != 1 {
+                    return Err(WolinError::Unauthenticated(
+                        "JWT header missing 'kid' against multi-key OIDC JWKS".to_string(),
+                    ));
+                }
+                vec![&self.keys[0]]
+            }
+        };
+
+        if candidates.is_empty() {
+            return Err(WolinError::Unauthenticated(
+                "JWT 'kid' did not match any public key in OIDC JWKS".to_string(),
+            ));
+        }
+
+        for jwk in candidates {
+            if let Some(jwk_alg) = jwk.get("alg").and_then(|v| v.as_str())
+                && jwk_alg.trim() != alg
+            {
+                continue;
+            }
+            if verify_jwk_signature(alg, jwk, signing_input, signature).is_ok() {
+                return Ok(());
+            }
+        }
+
+        Err(WolinError::Unauthenticated(
+            "OIDC JWT cryptographic signature verification failed against JWKS".to_string(),
+        ))
+    }
+}
+
 /// Compute an RFC 7638 §3.1 canonical SHA-256 JWK Thumbprint (unpadded Base64URL).
 pub fn compute_jwk_thumbprint_sha256(jwk: &serde_json::Value) -> Result<String> {
     let obj = jwk
@@ -1054,5 +1160,69 @@ mod tests {
         }
         let pub_ip: IpAddr = "93.184.216.34".parse().unwrap();
         assert!(is_public_global_ip(pub_ip));
+    }
+
+    #[test]
+    fn unit_jwks_signature_verifier_strict_kid_private_key_rejection_and_es256() {
+        use ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING;
+        use ring::signature::EcdsaKeyPair;
+
+        let rng = SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
+        let kp = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng)
+            .unwrap();
+        let pub_bytes = kp.public_key().as_ref();
+        let x_b64 = base64url_encode(&pub_bytes[1..33]);
+        let y_b64 = base64url_encode(&pub_bytes[33..65]);
+
+        let valid_jwks = json!({
+            "keys": [{
+                "kty": "EC",
+                "crv": "P-256",
+                "x": x_b64,
+                "y": y_b64,
+                "alg": "ES256",
+                "use": "sig",
+                "kid": "idp-es256-1"
+            }]
+        })
+        .to_string();
+
+        let verifier = JwksSignatureVerifier::from_jwks_json(&valid_jwks).unwrap();
+        let signing_input = b"eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJhbGljZSJ9";
+        let sig = kp.sign(&rng, signing_input).unwrap();
+
+        assert!(
+            verifier
+                .verify("ES256", Some("idp-es256-1"), signing_input, sig.as_ref())
+                .is_ok()
+        );
+        // Wrong kid MUST fail closed (never fallback to keys[0])
+        assert!(
+            verifier
+                .verify("ES256", Some("wrong-kid"), signing_input, sig.as_ref())
+                .is_err()
+        );
+        // Tampered signature MUST fail closed
+        let mut bad_sig = sig.as_ref().to_vec();
+        bad_sig[0] ^= 0xff;
+        assert!(
+            verifier
+                .verify("ES256", Some("idp-es256-1"), signing_input, &bad_sig)
+                .is_err()
+        );
+        // Reject private JWK fields and empty JWKS
+        assert!(JwksSignatureVerifier::from_jwks_json(r#"{"keys":[]}"#).is_err());
+        let leaked = json!({
+            "keys": [{
+                "kty": "EC",
+                "crv": "P-256",
+                "x": x_b64,
+                "y": y_b64,
+                "d": x_b64
+            }]
+        })
+        .to_string();
+        assert!(JwksSignatureVerifier::from_jwks_json(&leaked).is_err());
     }
 }
