@@ -33,8 +33,8 @@ wolin/
 
 ## 2. 프로덕션 핵심 기능 및 실측 풋프린트
 
-- **Per-Pod 물리 격리 & 쿼터**: Pod별 독립 Oxigraph RocksDB(`graph/pods/{pod_id}/`), Bounded LRU 핸들 캐시(기본 `256`), Pod당 기본 `1 GiB` 스토리지 쿼터(`$0` Free Tier 기본 제공, 초과 시 `413`/`507`).
-- **핸들 보안 & 영구 Tombstone**: `3..32`자 소문자 영숫자 규칙, 약 180개 기본 예약 핸들 차단(`--reserved-pods` 확장 지원), 삭제/은퇴 Pod 영구 동결(`410 Gone`).
+- **Per-Pod 물리 격리 & 쿼터**: Pod별 독립 Oxigraph RocksDB(`pods/{pod_id}/graph/`), Bounded LRU 핸들 캐시(기본 `256`), Pod당 기본 `1 GiB` 스토리지 쿼터(`$0` Free Tier 기본 제공, 초과 시 `413`/`507`).
+- **핸들 보안 & 영구 Tombstone**: `3..32`자 소문자 영숫자 규칙, 약 180개 기본 예약 핸들 차단(`--reserved-pods` 확장 지원), 삭제/은퇴 Pod 물리 데이터·ACL 즉시 파기 및 영구 동결(`409 Conflict` 재가입 차단).
 - **무-송신료(Zero-Egress) 서명 에셋 오프로딩**: DPoP + WAC/ACP 인가 통과 후 `256 KiB` 이상 `NonRDFSource`를 60초 유효 `HMAC-SHA256`(`wolin-asset-v1`) 서명 URL로 `302 Found` 리다이렉트하여 Cloudflare R2에서 직접 스트리밍.
 - **암호학적 JWKS & `at+jwt` 검증**: `JwksSignatureVerifier`(`--oidc-jwks-json` / `WOLIN_OIDC_JWKS_JSON`), DPoP `jti` 리플레이 캐시, `id_token` 오용을 원천 차단하는 `typ: "at+jwt"` 헤더 검증.
 - **실측 풋프린트 & 테스트 검증**:

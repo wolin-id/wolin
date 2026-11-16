@@ -33,8 +33,8 @@ wolin/
 
 ## 2. Production Capabilities & Verified Footprint
 
-- **Per-Pod Physical Isolation & Quotas**: Dedicated Oxigraph RocksDB per Pod (`graph/pods/{pod_id}/`), bounded LRU handle cache (`256` default via `WOLIN_MAX_OPEN_PODS`), and atomic `1 GiB` per-Pod storage quota (`$0` Free Tier default, `413`/`507` enforcement).
-- **Handle Security & Permanent Tombstones**: Enforces `3..32` lowercase ASCII handle rules, ~180 built-in reserved handles (+ `--reserved-pods`), and permanent Tombstone defense-in-depth (`410 Gone` on retired Pods).
+- **Per-Pod Physical Isolation & Quotas**: Dedicated Oxigraph RocksDB per Pod (`pods/{pod_id}/graph/`), bounded LRU handle cache (`256` default via `WOLIN_MAX_OPEN_PODS`), and atomic `1 GiB` per-Pod storage quota (`$0` Free Tier default, `413`/`507` enforcement).
+- **Handle Security & Permanent Tombstones**: Enforces `3..32` lowercase ASCII handle rules, ~180 built-in reserved handles (+ `--reserved-pods`), and permanent Tombstone defense-in-depth (immediate data/ACL purge + `409 Conflict` re-claim lock on retired Pods).
 - **Zero-Egress Signed Asset Offload**: Validates DPoP + WAC/ACP first, then issues a 60-second `HMAC-SHA256` (`wolin-asset-v1`) `302 Found` redirect (`>= 256 KiB` `NonRDFSource`) for direct Cloudflare R2 edge streaming (`/assets/:pod_id/*`).
 - **Cryptographic JWKS & `at+jwt` Verification**: `JwksSignatureVerifier` (`--oidc-jwks-json` / `WOLIN_OIDC_JWKS_JSON` supporting `ES256`, `ES384`, `RS256`, `PS256`, `EdDSA`), DPoP `jti` replay cache, and strict `typ: "at+jwt"` enforcement blocking `id_token` confusion.
 - **Verified Footprint & Test Suite**:
