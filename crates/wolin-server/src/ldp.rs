@@ -256,6 +256,22 @@ pub async fn handle_ldp_request(
     let headers = req.headers().clone();
     let body = req.into_body();
 
+    if method == Method::GET
+        && uri.path() == "/"
+        && headers.get(header::AUTHORIZATION).is_none()
+        && let Some(accept) = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok())
+        && accept.to_ascii_lowercase().contains("text/html")
+        && let Ok(Some((pod_id, _))) =
+            crate::pods::extract_subdomain_pod(&headers, &uri, &state.config)
+        && !state.config.reserved_pods.contains(&pod_id)
+    {
+        let cloud_domain = state.config.pod_cloud_domain.trim();
+        let target_url = format!("https://auth.{cloud_domain}/passport/{pod_id}");
+        if let Ok(loc) = HeaderValue::from_str(&target_url) {
+            return Ok((StatusCode::FOUND, [(header::LOCATION, loc)]).into_response());
+        }
+    }
+
     let principal = extract_principal_for_request(&method, &uri, &headers, &state).await?;
     let target = parse_ldp_target(&method, &uri, &headers, &state.config)?;
 
