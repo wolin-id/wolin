@@ -11,16 +11,25 @@ use std::collections::BTreeSet;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 pub use assets::{DEFAULT_ASSET_OFFLOAD_MIN_BYTES, DEFAULT_ASSET_SIGNING_TTL_SECS};
 use axum::{
     Router,
     extract::State,
+    http::{
+        HeaderName, Method,
+        header::{
+            ACCEPT, AUTHORIZATION, CONTENT_TYPE, ETAG, IF_MATCH, IF_NONE_MATCH, LINK, LOCATION,
+            WWW_AUTHENTICATE,
+        },
+    },
     response::Json,
     routing::{any, get, post},
 };
 use ldp::LdpCatalog;
 use serde_json::json;
+use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::{DefaultMakeSpan, TraceLayer};
 use wolin_identity::{
     DpopReplayCache, HttpWebIdDereferencer, JwksSignatureVerifier, JwtSignatureVerifier,
@@ -499,8 +508,40 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             .route("/mcp/sse", any(mcp::handle_mcp_disabled))
     };
 
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([
+            Method::GET,
+            Method::HEAD,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([
+            AUTHORIZATION,
+            CONTENT_TYPE,
+            ACCEPT,
+            IF_MATCH,
+            IF_NONE_MATCH,
+            LINK,
+            HeaderName::from_static("dpop"),
+            HeaderName::from_static("slug"),
+        ])
+        .expose_headers([
+            ETAG,
+            LINK,
+            LOCATION,
+            WWW_AUTHENTICATE,
+            HeaderName::from_static("wac-allow"),
+            HeaderName::from_static("dpop-nonce"),
+        ])
+        .max_age(Duration::from_secs(86400));
+
     router
         .fallback(ldp::handle_ldp_request)
+        .layer(cors)
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(DefaultMakeSpan::new().include_headers(false)),
